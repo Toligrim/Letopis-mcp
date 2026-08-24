@@ -319,6 +319,32 @@ def _populate_archive(path: Path) -> None:
         sender_id=11,
         sender_name="Алиса",
     )
+    poll_duplicate = json.dumps(
+        {
+            "question": "Какой формат выбрать для дедупликации опросов?",
+            "answers": ["Первый вариант", "Второй вариант"],
+        },
+        ensure_ascii=False,
+    )
+    for message_id, sender_id, sender_name in (
+        (503, 12, "Борис"),
+        (504, 13, "Вера"),
+    ):
+        _insert_message(
+            writable,
+            lem,
+            rows,
+            chat_id=WORK_CHAT_ID,
+            message_id=message_id,
+            topic_id=303,
+            date=f"2025-02-{message_id - 494:02d}T09:00:00",
+            text="",
+            poll=poll_duplicate,
+            media_type="MessageMediaPoll",
+            media_kind="poll",
+            sender_id=sender_id,
+            sender_name=sender_name,
+        )
     reactions_row = _insert_message(
         writable,
         lem,
@@ -410,6 +436,10 @@ def synthetic_archive(tmp_path: Path, monkeypatch):
     archive.cases = {
         "transcript_only": by_public_id[_public_id(WORK_CHAT_ID, 500)],
         "poll": by_public_id[_public_id(WORK_CHAT_ID, 501)],
+        "poll_duplicates": [
+            by_public_id[_public_id(WORK_CHAT_ID, message_id)]
+            for message_id in (503, 504)
+        ],
         "reactions": by_public_id[_public_id(SIDE_CHAT_ID, 500)],
         "media_only": [
             by_public_id[_public_id(SIDE_CHAT_ID, 501)],

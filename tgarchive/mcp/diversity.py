@@ -9,6 +9,7 @@ from typing import Any, Sequence
 from ..lemma import normalize
 from ..search import WORD_RE
 from .models import SEARCH_CHAT_TOPIC_MAX_RESULTS, SEARCH_LOCAL_BURST_MAX_RESULTS
+from .snippets import _poll_text
 
 
 # A local burst is a connected run of message IDs whose neighbouring messages
@@ -31,7 +32,12 @@ class _Candidate:
 
 def _candidate_text(row: Any) -> str:
     text = row["text"] or row["transcript"] or ""
-    return str(text)
+    if text:
+        return str(text)
+    poll_text = _poll_text(row["poll"])
+    if poll_text:
+        return poll_text
+    return str(row["media_name"] or "")
 
 
 def _normalized_text(value: str) -> str:

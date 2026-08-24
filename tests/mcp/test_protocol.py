@@ -45,6 +45,16 @@ async def test_official_mcp_client_protocol_contract(synthetic_archive, monkeypa
             "fetch_messages",
             "get_context",
         }
+        descriptions = {
+            name: (tool.description or "")
+            for name, tool in tools_by_name.items()
+        }
+        assert all(len(description) > 100 for description in descriptions.values())
+        assert "snippet" in descriptions["search_messages"].lower()
+        assert "diverse" in descriptions["search_messages"].lower()
+        assert "coverage" in descriptions["aggregate_messages"].lower()
+        assert "shortlist" in descriptions["fetch_messages"].lower()
+        assert "small" in descriptions["get_context"].lower()
         assert all(tool.input_schema for tool in listing.tools)
         assert all(tool.input_schema.get("additionalProperties") is False for tool in listing.tools)
         search_input_schema = tools_by_name["search_messages"].input_schema

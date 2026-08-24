@@ -631,7 +631,7 @@ def _search_parts(filters: SearchFilters | None) -> tuple[list[str], list[Any]]:
 
 
 def _build_match(query: str, match_mode: str) -> str:
-    return build_match(query, Lemmatizer(), any_mode=match_mode == "or")
+    return build_match(query, Lemmatizer(), match_mode=match_mode)
 
 
 def _decode_topic_group_key(key: str | int | None) -> tuple[int, int | None]:
@@ -822,9 +822,15 @@ def search_messages(
     """
     with _readonly_connection(conn, tool_name="search_messages") as readonly:
         lem = Lemmatizer()
-        any_mode = request.match_mode == "or"
-        query_groups = parse_query_groups(request.query, lem, any_mode=any_mode)
-        match = build_match_from_groups(query_groups, any_mode=any_mode)
+        query_groups = parse_query_groups(
+            request.query,
+            lem,
+            match_mode=request.match_mode,
+        )
+        match = build_match_from_groups(
+            query_groups,
+            match_mode=request.match_mode,
+        )
         cond, params = _search_parts(request.filters)
         total_hits = None
         if request.include_total:

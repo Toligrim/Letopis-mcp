@@ -102,3 +102,14 @@ def test_diverse_soft_burst_limit_backfills_when_no_alternatives_exist(synthetic
     assert result.total_hits == 6
     assert result.returned_hits == 6
     assert {hit.id for hit in result.hits} == expected_ids
+
+
+def test_diverse_suppresses_duplicate_poll_content(synthetic_archive):
+    result = _search(synthetic_archive, "дедупликация опросов", limit=2)
+    duplicate_ids = {
+        row["message_id"] for row in synthetic_archive.cases["poll_duplicates"]
+    }
+
+    assert result.total_hits == len(duplicate_ids) == 2
+    assert result.returned_hits == 1
+    assert {hit.message_id for hit in result.hits} < duplicate_ids

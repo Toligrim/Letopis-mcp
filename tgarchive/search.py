@@ -1,11 +1,13 @@
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 from .lemma import Lemmatizer, normalize
 
 TOKEN_RE = re.compile(r'"[^"]*"|\S+')
 WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-я]+")  # после normalize() буквы ё нет
 WORD_ONLY_RE = re.compile(r"^[0-9A-Za-zА-Яа-я]+$")
+SearchMatchMode = Literal["and", "or", "boolean"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,8 +77,11 @@ def parse_query_groups(
     query: str,
     lem: Lemmatizer,
     any_mode: bool = False,
+    *,
+    match_mode: SearchMatchMode | None = None,
 ) -> list[QueryGroup]:
     """Parse query units once for both FTS matching and snippet matching."""
+    mode = _resolve_match_mode(any_mode, match_mode)
     groups = []
     pending = "AND"
     for part in TOKEN_RE.findall(query):
@@ -89,7 +94,13 @@ def parse_query_groups(
                 QueryGroup(
                     words=group.words,
                     lemmas=group.lemmas,
-                    operator="OR" if any_mode else pending,
+                    operator=(
+                        "OR"
+                        if mode == "or"
+                        else "AND"
+                        if mode == "and"
+                        else pending
+                    ),
                     prefix=group.prefix,
                     phrase=group.phrase,
                 )
@@ -114,20 +125,52 @@ def _make_group(token: str, lem: Lemmatizer):
     return _group_expression(group) if group is not None else None
 
 
-def build_match_from_groups(groups: list[QueryGroup], any_mode: bool = False) -> str:
+def _resolve_match_mode(
+    any_mode: bool,
+    match_mode: SearchMatchMode | None,
+) -> SearchMatchMode:
+    if match_mode is not None:
+        if match_mode not in ("and", "or", "boolean"):
+            raise ValueError("match_mode must be one of: and, or, boolean")
+        return match_mode
+    # Preserve the legacy public API: any_mode=False allowed explicit Boolean
+    # operators, while any_mode=True forced OR between all groups.
+    return "or" if any_mode else "boolean"
+
+
+def build_match_from_groups(
+    groups: list[QueryGroup],
+    any_mode: bool = False,
+    *,
+    match_mode: SearchMatchMode | None = None,
+) -> str:
     if not groups:
         raise ValueError("Пустой поисковый запрос")
+    mode = _resolve_match_mode(any_mode, match_mode)
     expr = _group_expression(groups[0])
     for group in groups[1:]:
-        operator = "OR" if any_mode else group.operator
+        operator = (
+            "OR"
+            if mode == "or"
+            else "AND"
+            if mode == "and"
+            else group.operator
+        )
         expr += f" {operator} {_group_expression(group)}"
     return expr
 
 
-def build_match(query: str, lem: Lemmatizer, any_mode: bool = False) -> str:
+def build_match(
+    query: str,
+    lem: Lemmatizer,
+    any_mode: bool = False,
+    *,
+    match_mode: SearchMatchMode | None = None,
+) -> str:
     """Строит FTS5 MATCH-выражение: каждое слово ищется и как есть, и по лемме."""
-    groups = parse_query_groups(query, lem, any_mode=any_mode)
-    return build_match_from_groups(groups, any_mode=any_mode)
+    mode = _resolve_match_mode(any_mode, match_mode)
+    groups = parse_query_groups(query, lem, any_mode=any_mode, match_mode=mode)
+    return build_match_from_groups(groups, any_mode=any_mode, match_mode=mode)
 
 
 def pad_date_from(s: str) -> str:

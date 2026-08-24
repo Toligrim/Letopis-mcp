@@ -121,9 +121,45 @@ FetchResult = Annotated[CallToolResult, _FetchWire]
 ContextResult = Annotated[CallToolResult, _ContextWire]
 
 _ArchiveChatIDs = Annotated[list[int] | None, Field(max_length=ARCHIVE_CHAT_IDS_MAX)]
-_SearchQuery = Annotated[str, Field(min_length=1, max_length=SEARCH_QUERY_MAX_CHARS)]
+_SearchQuery = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=SEARCH_QUERY_MAX_CHARS,
+        description="Search terms, phrases, and optional Boolean operators for discovery.",
+    ),
+]
+_SearchMatchMode = Annotated[
+    MatchMode,
+    Field(
+        description=(
+            "and requires every search unit; or matches any unit; boolean honors "
+            "explicit AND/OR operators in the query."
+        )
+    ),
+]
+_SearchSort = Annotated[
+    SearchSort,
+    Field(description="Use relevance for stable cursor pagination or chronological ordering when needed."),
+]
+_SearchStrategy = Annotated[
+    SearchStrategy,
+    Field(
+        description=(
+            "diverse returns a bounded first exploratory sample; relevance is the "
+            "strategy for sequential cursor pagination."
+        )
+    ),
+]
 _SearchLimit = Annotated[int, Field(ge=1, le=SEARCH_LIMIT_HARD_MAX)]
-_SnippetChars = Annotated[int, Field(ge=SNIPPET_CHARS_MIN, le=SNIPPET_CHARS_MAX)]
+_SnippetChars = Annotated[
+    int,
+    Field(
+        ge=SNIPPET_CHARS_MIN,
+        le=SNIPPET_CHARS_MAX,
+        description="Maximum characters in each bounded evidence snippet; it is not the full message.",
+    ),
+]
 _AggregateLimit = Annotated[int, Field(ge=1, le=AGGREGATE_LIMIT_HARD_MAX)]
 _FilterIDs = Annotated[list[int], Field(max_length=SEARCH_FILTER_ID_LIST_MAX)]
 _FilterSenderName = Annotated[
@@ -157,7 +193,11 @@ class _SearchFiltersWire(BaseModel):
 
 _FetchIDs = Annotated[
     list[Annotated[str, StringConstraints(pattern=r"^tg:-?\d+:\d+$")]],
-    Field(min_length=FETCH_IDS_MIN, max_length=FETCH_IDS_MAX),
+    Field(
+        min_length=FETCH_IDS_MIN,
+        max_length=FETCH_IDS_MAX,
+        description="Shortlist of stable message IDs obtained from search_messages.",
+    ),
 ]
 _FetchChars = Annotated[int, Field(ge=0, le=FETCH_PER_MESSAGE_MAX_CHARS_HARD_MAX)]
 _ContextWindow = Annotated[int, Field(ge=0, le=CONTEXT_BEFORE_AFTER_HARD_MAX)]
@@ -219,7 +259,11 @@ def archive_overview(
     limit: Annotated[int, Field(ge=1, le=ARCHIVE_LIMIT_HARD_MAX)] = ARCHIVE_LIMIT_DEFAULT,
     cursor: _Cursor = None,
 ) -> ArchiveResult:
-    """Return a compact read-only overview of the archive."""
+    """Orient yourself with a compact read-only map of the archive.
+
+    This returns chat/date/topic structure and counts, not a listing of every
+    message. Use it to choose useful search scopes before retrieving evidence.
+    """
     request = ArchiveOverviewInput(
         chat_ids=chat_ids,
         include_topics=include_topics,
@@ -231,16 +275,22 @@ def archive_overview(
 
 def search_messages(
     query: _SearchQuery,
-    match_mode: MatchMode = SEARCH_MATCH_MODE_DEFAULT,
+    match_mode: _SearchMatchMode = SEARCH_MATCH_MODE_DEFAULT,
     filters: _SearchFiltersWire | None = None,
-    sort: SearchSort = SEARCH_SORT_DEFAULT,
-    strategy: SearchStrategy = SEARCH_STRATEGY_DEFAULT,
+    sort: _SearchSort = SEARCH_SORT_DEFAULT,
+    strategy: _SearchStrategy = SEARCH_STRATEGY_DEFAULT,
     limit: _SearchLimit = SEARCH_LIMIT_DEFAULT,
     snippet_chars: _SnippetChars = SNIPPET_CHARS_DEFAULT,
     include_total: bool = SEARCH_INCLUDE_TOTAL_DEFAULT,
     cursor: _Cursor = None,
 ) -> SearchResult:
-    """Search messages; diverse is bounded and cannot be cursor-paginated."""
+    """Discover candidate messages in the archive with bounded snippets.
+
+    The snippet is compact evidence, not the full message. Use
+    ``strategy=diverse`` for the first exploratory sample across the corpus;
+    use ``strategy=relevance`` when you need stable sequential cursor
+    pagination or a complete relevance-ordered pass.
+    """
     request = SearchMessagesInput(
         query=query,
         match_mode=match_mode,
@@ -258,12 +308,17 @@ def search_messages(
 def aggregate_messages(
     query: _SearchQuery,
     group_by: AggregateGroupBy,
-    match_mode: MatchMode = SEARCH_MATCH_MODE_DEFAULT,
+    match_mode: _SearchMatchMode = SEARCH_MATCH_MODE_DEFAULT,
     filters: _SearchFiltersWire | None = None,
     limit: _AggregateLimit = AGGREGATE_LIMIT_DEFAULT,
     cursor: _Cursor = None,
 ) -> AggregateResult:
-    """Aggregate matching messages by a requested archive dimension."""
+    """Check search coverage by counting matches across an archive dimension.
+
+    Use this to see whether a query is narrow or widespread and where matches
+    cluster. It is a coverage diagnostic, not a replacement for
+    ``search_messages`` and does not provide message evidence.
+    """
     request = AggregateMessagesInput(
         query=query,
         group_by=group_by,
@@ -282,7 +337,12 @@ def fetch_messages(
     include_reactions: bool = FETCH_INCLUDE_REACTIONS_DEFAULT,
     per_message_max_chars: _FetchChars = FETCH_PER_MESSAGE_MAX_CHARS_DEFAULT,
 ) -> FetchResult:
-    """Fetch a bounded shortlist of messages by stable public IDs."""
+    """Fetch bounded full details for a short candidate shortlist.
+
+    Call this only after ``search_messages`` has produced a shortlist of
+    stable message IDs. It is for inspecting selected messages, not for
+    discovering or exporting the archive.
+    """
     request = FetchMessagesInput(
         ids=ids,
         include_transcript=include_transcript,
@@ -301,7 +361,11 @@ def get_context(
     include_transcripts: bool = CONTEXT_INCLUDE_TRANSCRIPTS_DEFAULT,
     message_max_chars: _ContextChars = CONTEXT_MESSAGE_MAX_CHARS_DEFAULT,
 ) -> ContextResult:
-    """Return a bounded local context window around one message."""
+    """Read the neighboring conversation around one known message.
+
+    Start with a small ``before``/``after`` window and expand only when the
+    local context is insufficient; use a search result ID as the pivot.
+    """
     request = GetContextInput(
         id=id,
         before=before,

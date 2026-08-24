@@ -42,11 +42,17 @@ def test_match_modes_total_hits_limit_and_public_ids(synthetic_archive):
         _request("пагинация OR разнообразия", match_mode="boolean", limit=50),
         conn=connection,
     )
+    explicit_or_in_and = retrieval.search_messages(
+        _request("пагинация OR разнообразия", match_mode="and", limit=50),
+        conn=connection,
+    )
     boolean_and = retrieval.search_messages(
         _request("пагинация AND разнообразия", match_mode="boolean", limit=20),
         conn=connection,
     )
     assert boolean_or.total_hits == 60
+    assert explicit_or_in_and.total_hits == 0
+    assert explicit_or_in_and.returned_hits == 0
     assert boolean_and.total_hits == 0
     assert boolean_and.returned_hits == 0
 
