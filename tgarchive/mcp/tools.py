@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict as _asdict, is_dataclass as _is_dataclass
+import hashlib
+import json
 import logging
 import re
 import time
 from typing import Callable, TypeVar
+import uuid
 
 from . import ratelimit, retrieval
+from .cursor import query_fingerprint as _query_fingerprint
 from .models import (
     AGGREGATE_LIMIT_HARD_MAX,
     ARCHIVE_CHAT_IDS_MAX,
@@ -55,6 +60,78 @@ ToolResultT = TypeVar("ToolResultT")
 _LOGGER = logging.getLogger("letopis_mcp")
 
 
+def _short_request_fingerprint(request: object | None) -> str | None:
+    if request is None:
+        return None
+    try:
+        if isinstance(request, SearchMessagesInput):
+            fingerprint = _query_fingerprint(
+                request.query,
+                request.match_mode,
+                request.filters,
+                request.sort,
+            )
+        elif isinstance(request, AggregateMessagesInput):
+            fingerprint = _query_fingerprint(
+                request.query,
+                request.match_mode,
+                request.filters,
+                "aggregate",
+                group_by=request.group_by,
+            )
+        elif isinstance(request, ArchiveOverviewInput):
+            fingerprint = _query_fingerprint(
+                "",
+                "archive",
+                {"chat_ids": request.chat_ids},
+                "archive_overview",
+                extra={"include_topics": request.include_topics},
+            )
+        elif _is_dataclass(request):
+            serialized = json.dumps(
+                _asdict(request),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+            fingerprint = hashlib.sha256(serialized).hexdigest()
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return fingerprint[:12]
+
+
+def _filter_metadata(request: object | None) -> dict[str, bool]:
+    filters = getattr(request, "filters", None)
+    if filters is None and isinstance(request, ArchiveOverviewInput):
+        filters = request
+
+    def has_value(name: str) -> bool:
+        return getattr(filters, name, None) is not None and bool(getattr(filters, name))
+
+    return {
+        "has_chat_filter": has_value("chat_ids"),
+        "has_topic_filter": has_value("topic_ids"),
+        "has_sender_filter": has_value("sender_id") or has_value("sender_name"),
+        "has_date_filter": has_value("date_from") or has_value("date_to"),
+        "has_media_filter": has_value("media"),
+    }
+
+
+def _returned_count(result: object) -> int | None:
+    for collection_name in ("hits", "groups", "chats", "messages"):
+        collection = getattr(result, collection_name, None)
+        if isinstance(collection, (list, tuple)):
+            return len(collection)
+    for field in ("returned_hits", "returned_groups", "returned_chats"):
+        value = getattr(result, field, None)
+        if isinstance(value, int):
+            return value
+    return None
+
+
 def _log_tool_call(
     tool_name: str,
     started: float,
@@ -62,12 +139,23 @@ def _log_tool_call(
     *,
     result: ToolResultT | ErrorResponse | None = None,
     error_code: ErrorCode | None = None,
+    request_id: str | None = None,
+    request: object | None = None,
+    diagnostics: dict[str, object] | None = None,
 ) -> None:
     fields: dict[str, object] = {
         "tool": tool_name,
         "status": status,
         "latency_ms": round((time.perf_counter() - started) * 1000, 3),
     }
+    if request_id is not None:
+        fields["request_id"] = request_id
+    fingerprint = _short_request_fingerprint(request)
+    if fingerprint is not None:
+        fields["query_fingerprint"] = fingerprint
+    if request is not None:
+        fields.update(_filter_metadata(request))
+        fields["cursor_used"] = bool(getattr(request, "cursor", None))
     if isinstance(result, ErrorResponse):
         error_code = result.code
     elif result is not None:
@@ -75,14 +163,41 @@ def _log_tool_call(
             value = getattr(result, field, None)
             if value is not None:
                 fields[field] = value
+        returned_count = _returned_count(result)
+        if returned_count is not None:
+            fields["returned_count"] = returned_count
+    if diagnostics is not None:
+        for field in ("sql_time_ms", "candidate_pool_size"):
+            value = diagnostics.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                fields[field] = value
     if error_code is not None:
         fields["error_code"] = error_code.value
     _LOGGER.info("tool_call", extra=fields)
 
 
-def _handle_tool(tool_name: str, callback: Callable[[], ToolResultT]) -> ToolResultT | ErrorResponse:
+def _handle_tool(
+    tool_name: str,
+    callback: Callable[[], ToolResultT],
+    *,
+    request: object | None = None,
+) -> ToolResultT | ErrorResponse:
     """Convert all public tool failures to the wire-level error model."""
     started = time.perf_counter()
+    request_id = uuid.uuid4().hex[:12]
+    retrieval.reset_diagnostics()
+
+    def log(status: str, result: object) -> None:
+        _log_tool_call(
+            tool_name,
+            started,
+            status,
+            result=result,
+            request_id=request_id,
+            request=request,
+            diagnostics=retrieval.take_diagnostics(),
+        )
+
     if not ratelimit.can_start():
         error = ErrorResponse(
             code=ErrorCode.RETRIEVAL_RATE_LIMITED,
@@ -90,7 +205,7 @@ def _handle_tool(tool_name: str, callback: Callable[[], ToolResultT]) -> ToolRes
             retryable=True,
             details={"scope": "global"},
         )
-        _log_tool_call(tool_name, started, "error", result=error)
+        log("error", error)
         return error
     try:
         result = callback()
@@ -102,7 +217,7 @@ def _handle_tool(tool_name: str, callback: Callable[[], ToolResultT]) -> ToolRes
             retryable=exc.retryable,
             details=dict(exc.details or {}),
         )
-        _log_tool_call(tool_name, started, "error", result=error)
+        log("error", error)
         return error
     except Exception:
         ratelimit.cancel_pending()
@@ -112,11 +227,11 @@ def _handle_tool(tool_name: str, callback: Callable[[], ToolResultT]) -> ToolRes
             retryable=False,
             details={},
         )
-        _log_tool_call(tool_name, started, "error", result=error)
+        log("error", error)
         return error
     if isinstance(result, ErrorResponse):
         ratelimit.cancel_pending()
-        _log_tool_call(tool_name, started, "error", result=result)
+        log("error", result)
     else:
         response_chars = getattr(result, "response_chars", None)
         if isinstance(response_chars, int):
@@ -127,11 +242,11 @@ def _handle_tool(tool_name: str, callback: Callable[[], ToolResultT]) -> ToolRes
                     retryable=True,
                     details={"scope": "global", "phase": "completion"},
                 )
-                _log_tool_call(tool_name, started, "error", result=error)
+                log("error", error)
                 return error
         else:
             ratelimit.cancel_pending()
-        _log_tool_call(tool_name, started, "ok", result=result)
+        log("ok", result)
     return result
 
 
@@ -292,7 +407,11 @@ def _archive_overview(request: ArchiveOverviewInput) -> ArchiveOverviewOutput:
 def archive_overview(
     request: ArchiveOverviewInput,
 ) -> ArchiveOverviewOutput | ErrorResponse:
-    return _handle_tool("archive_overview", lambda: _archive_overview(request))
+    return _handle_tool(
+        "archive_overview",
+        lambda: _archive_overview(request),
+        request=request,
+    )
 
 
 def _aggregate_messages(request: AggregateMessagesInput) -> AggregateMessagesOutput:
@@ -329,7 +448,11 @@ def _aggregate_messages(request: AggregateMessagesInput) -> AggregateMessagesOut
 def aggregate_messages(
     request: AggregateMessagesInput,
 ) -> AggregateMessagesOutput | ErrorResponse:
-    return _handle_tool("aggregate_messages", lambda: _aggregate_messages(request))
+    return _handle_tool(
+        "aggregate_messages",
+        lambda: _aggregate_messages(request),
+        request=request,
+    )
 
 
 def _search_messages(request: SearchMessagesInput) -> SearchMessagesOutput:
@@ -388,7 +511,11 @@ def _search_messages(request: SearchMessagesInput) -> SearchMessagesOutput:
 
 
 def search_messages(request: SearchMessagesInput) -> SearchMessagesOutput | ErrorResponse:
-    return _handle_tool("search_messages", lambda: _search_messages(request))
+    return _handle_tool(
+        "search_messages",
+        lambda: _search_messages(request),
+        request=request,
+    )
 
 
 def _fetch_messages(request: FetchMessagesInput) -> FetchMessagesOutput:
@@ -412,7 +539,11 @@ def _fetch_messages(request: FetchMessagesInput) -> FetchMessagesOutput:
 
 
 def fetch_messages(request: FetchMessagesInput) -> FetchMessagesOutput | ErrorResponse:
-    return _handle_tool("fetch_messages", lambda: _fetch_messages(request))
+    return _handle_tool(
+        "fetch_messages",
+        lambda: _fetch_messages(request),
+        request=request,
+    )
 
 
 def _get_context(request: GetContextInput) -> GetContextOutput:
@@ -437,4 +568,8 @@ def _get_context(request: GetContextInput) -> GetContextOutput:
 
 
 def get_context(request: GetContextInput) -> GetContextOutput | ErrorResponse:
-    return _handle_tool("get_context", lambda: _get_context(request))
+    return _handle_tool(
+        "get_context",
+        lambda: _get_context(request),
+        request=request,
+    )

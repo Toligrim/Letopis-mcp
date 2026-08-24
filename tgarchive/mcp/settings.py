@@ -225,10 +225,21 @@ class _JsonLogFormatter(logging.Formatter):
     _FIELDS = (
         "tool",
         "status",
+        "request_id",
+        "query_fingerprint",
+        "has_chat_filter",
+        "has_topic_filter",
+        "has_sender_filter",
+        "has_date_filter",
+        "has_media_filter",
+        "cursor_used",
         "latency_ms",
         "response_chars",
+        "returned_count",
         "truncated",
         "total_hits",
+        "sql_time_ms",
+        "candidate_pool_size",
         "error_code",
     )
 
