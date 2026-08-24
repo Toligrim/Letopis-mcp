@@ -13,8 +13,13 @@ dependencies = [
     "tomli; python_version < '3.11'",
 ]
 
+[project.optional-dependencies]
+mcp = ["mcp>=2.0,<3"]
+test = ["pytest>=8"]
+
 [project.scripts]
 tg = "tgarchive.cli:main"
+letopis-mcp = "tgarchive.mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,0 +1,366 @@
+"""Thin typed handlers for the basic MCP retrieval tools."""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+from typing import Callable, TypeVar
+
+from . import ratelimit, retrieval
+from .models import (
+    AGGREGATE_LIMIT_HARD_MAX,
+    ARCHIVE_CHAT_IDS_MAX,
+    ARCHIVE_LIMIT_HARD_MAX,
+    CONTEXT_BEFORE_AFTER_HARD_MAX,
+    CONTEXT_MESSAGE_MAX_CHARS_HARD_MAX,
+    FETCH_IDS_MAX,
+    FETCH_IDS_MIN,
+    FETCH_PER_MESSAGE_MAX_CHARS_HARD_MAX,
+    SEARCH_LIMIT_HARD_MAX,
+    SEARCH_QUERY_MAX_CHARS,
+    SNIPPET_CHARS_MAX,
+    SNIPPET_CHARS_MIN,
+    AggregateMessagesInput,
+    AggregateMessagesOutput,
+    ArchiveOverviewInput,
+    ArchiveOverviewOutput,
+    FetchMessagesInput,
+    FetchMessagesOutput,
+    GetContextInput,
+    GetContextOutput,
+    SearchFilters,
+    SearchMessagesInput,
+    SearchMessagesOutput,
+    ErrorCode,
+    ErrorResponse,
+    ToolError,
+)
+
+
+_MATCH_MODES = {"and", "or", "boolean"}
+_GROUP_BY = {"chat", "topic", "sender", "month", "quarter", "year"}
+_SEARCH_SORTS = {"relevance", "oldest", "newest"}
+_SEARCH_STRATEGIES = {"relevance", "diverse"}
+_PUBLIC_ID_RE = re.compile(r"^tg:(-?\d+):(\d+)$", re.ASCII)
+ToolResultT = TypeVar("ToolResultT")
+_LOGGER = logging.getLogger("letopis_mcp")
+
+
+def _log_tool_call(
+    tool_name: str,
+    started: float,
+    status: str,
+    *,
+    result: ToolResultT | ErrorResponse | None = None,
+    error_code: ErrorCode | None = None,
+) -> None:
+    fields: dict[str, object] = {
+        "tool": tool_name,
+        "status": status,
+        "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+    }
+    if isinstance(result, ErrorResponse):
+        error_code = result.code
+    elif result is not None:
+        for field in ("response_chars", "truncated", "total_hits"):
+            value = getattr(result, field, None)
+            if value is not None:
+                fields[field] = value
+    if error_code is not None:
+        fields["error_code"] = error_code.value
+    _LOGGER.info("tool_call", extra=fields)
+
+
+def _handle_tool(tool_name: str, callback: Callable[[], ToolResultT]) -> ToolResultT | ErrorResponse:
+    """Convert all public tool failures to the wire-level error model."""
+    started = time.perf_counter()
+    if not ratelimit.can_start():
+        error = ErrorResponse(
+            code=ErrorCode.RETRIEVAL_RATE_LIMITED,
+            message="Global retrieval rate limit exceeded; retry later",
+            retryable=True,
+            details={"scope": "global"},
+        )
+        _log_tool_call(tool_name, started, "error", result=error)
+        return error
+    try:
+        result = callback()
+    except ToolError as exc:
+        ratelimit.cancel_pending()
+        error = ErrorResponse(
+            code=exc.code,
+            message=exc.message,
+            retryable=exc.retryable,
+            details=dict(exc.details or {}),
+        )
+        _log_tool_call(tool_name, started, "error", result=error)
+        return error
+    except Exception:
+        ratelimit.cancel_pending()
+        error = ErrorResponse(
+            code=ErrorCode.INTERNAL_ERROR,
+            message="Internal error while handling tool request",
+            retryable=False,
+            details={},
+        )
+        _log_tool_call(tool_name, started, "error", result=error)
+        return error
+    if isinstance(result, ErrorResponse):
+        ratelimit.cancel_pending()
+        _log_tool_call(tool_name, started, "error", result=result)
+    else:
+        response_chars = getattr(result, "response_chars", None)
+        if isinstance(response_chars, int):
+            ratelimit.record_completed(response_chars)
+        else:
+            ratelimit.cancel_pending()
+        _log_tool_call(tool_name, started, "ok", result=result)
+    return result
+
+
+def _validate_limit(value: int, hard_max: int, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= hard_max:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"{field} must be an integer between 1 and {hard_max}",
+        )
+
+
+def _validate_cursor(cursor: str | None) -> None:
+    if cursor is not None and not isinstance(cursor, str):
+        raise ToolError(code=ErrorCode.INVALID_ARGUMENT, message="cursor must be a string")
+
+
+def _validate_bool(value: bool, field: str) -> None:
+    if not isinstance(value, bool):
+        raise ToolError(code=ErrorCode.INVALID_ARGUMENT, message=f"{field} must be a boolean")
+
+
+def _validate_range(value: int, minimum: int, maximum: int, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"{field} must be an integer between {minimum} and {maximum}",
+        )
+
+
+def _parse_public_id(value: str) -> tuple[int, int]:
+    if not isinstance(value, str):
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="ids must contain strings in tg:<chat_id>:<message_id> format",
+        )
+    match = _PUBLIC_ID_RE.fullmatch(value)
+    if match is None:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"invalid public message ID: {value!r}",
+        )
+    return int(match.group(1)), int(match.group(2))
+
+
+def _validate_public_ids(ids: list[str]) -> list[tuple[int, int]]:
+    if not isinstance(ids, list):
+        raise ToolError(code=ErrorCode.INVALID_ARGUMENT, message="ids must be a list")
+    if not FETCH_IDS_MIN <= len(ids) <= FETCH_IDS_MAX:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"ids must contain between {FETCH_IDS_MIN} and {FETCH_IDS_MAX} IDs",
+        )
+    parsed = [_parse_public_id(value) for value in ids]
+    if len(set(parsed)) != len(parsed):
+        raise ToolError(code=ErrorCode.INVALID_ARGUMENT, message="ids must be unique")
+    return parsed
+
+
+def _validate_filters(filters: SearchFilters | None) -> None:
+    if filters is None:
+        return
+    if not isinstance(filters, SearchFilters):
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="filters must be SearchFilters or None",
+        )
+    for name in ("chat_ids", "topic_ids"):
+        values = getattr(filters, name)
+        if values is not None and (
+            not isinstance(values, list)
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in values)
+        ):
+            raise ToolError(
+                code=ErrorCode.INVALID_ARGUMENT,
+                message=f"{name} must be a list of integers",
+            )
+    if filters.sender_id is not None and (
+        isinstance(filters.sender_id, bool) or not isinstance(filters.sender_id, int)
+    ):
+        raise ToolError(code=ErrorCode.INVALID_ARGUMENT, message="sender_id must be an integer")
+    for name in ("sender_name", "date_from", "date_to", "media"):
+        value = getattr(filters, name)
+        if value is not None and not isinstance(value, str):
+            raise ToolError(code=ErrorCode.INVALID_ARGUMENT, message=f"{name} must be a string")
+
+
+def _validate_chat_ids(chat_ids: list[int] | None) -> None:
+    if chat_ids is None:
+        return
+    if len(chat_ids) > ARCHIVE_CHAT_IDS_MAX:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"chat_ids must contain at most {ARCHIVE_CHAT_IDS_MAX} IDs",
+        )
+    if any(isinstance(chat_id, bool) or not isinstance(chat_id, int) for chat_id in chat_ids):
+        raise ToolError(code=ErrorCode.INVALID_ARGUMENT, message="chat_ids must contain integers")
+
+
+def _archive_overview(request: ArchiveOverviewInput) -> ArchiveOverviewOutput:
+    """Validate and delegate the archive overview request."""
+    if not isinstance(request, ArchiveOverviewInput):
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="request must be ArchiveOverviewInput",
+        )
+    _validate_chat_ids(request.chat_ids)
+    _validate_limit(request.limit, ARCHIVE_LIMIT_HARD_MAX, "limit")
+    _validate_cursor(request.cursor)
+    return retrieval.archive_overview(request)
+
+
+def archive_overview(
+    request: ArchiveOverviewInput,
+) -> ArchiveOverviewOutput | ErrorResponse:
+    return _handle_tool("archive_overview", lambda: _archive_overview(request))
+
+
+def _aggregate_messages(request: AggregateMessagesInput) -> AggregateMessagesOutput:
+    """Validate and delegate the aggregate request."""
+    if not isinstance(request, AggregateMessagesInput):
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="request must be AggregateMessagesInput",
+        )
+    if not isinstance(request.query, str) or not request.query.strip():
+        raise ToolError(code=ErrorCode.INVALID_QUERY, message="query must be a non-empty string")
+    if request.match_mode not in _MATCH_MODES:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"match_mode must be one of {sorted(_MATCH_MODES)}",
+        )
+    if request.group_by not in _GROUP_BY:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"group_by must be one of {sorted(_GROUP_BY)}",
+        )
+    _validate_filters(request.filters)
+    _validate_limit(request.limit, AGGREGATE_LIMIT_HARD_MAX, "limit")
+    _validate_cursor(request.cursor)
+    try:
+        return retrieval.aggregate_messages(request)
+    except ValueError as exc:
+        raise ToolError(
+            code=ErrorCode.INVALID_QUERY,
+            message="query could not be parsed",
+        ) from exc
+
+
+def aggregate_messages(
+    request: AggregateMessagesInput,
+) -> AggregateMessagesOutput | ErrorResponse:
+    return _handle_tool("aggregate_messages", lambda: _aggregate_messages(request))
+
+
+def _search_messages(request: SearchMessagesInput) -> SearchMessagesOutput:
+    """Validate and delegate the basic search request."""
+    if not isinstance(request, SearchMessagesInput):
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="request must be SearchMessagesInput",
+        )
+    if not isinstance(request.query, str) or not request.query.strip():
+        raise ToolError(code=ErrorCode.INVALID_QUERY, message="query must be a non-empty string")
+    if len(request.query) > SEARCH_QUERY_MAX_CHARS:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"query must be at most {SEARCH_QUERY_MAX_CHARS} characters",
+        )
+    if request.match_mode not in _MATCH_MODES:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"match_mode must be one of {sorted(_MATCH_MODES)}",
+        )
+    if request.sort not in _SEARCH_SORTS:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"sort must be one of {sorted(_SEARCH_SORTS)}",
+        )
+    if request.strategy not in _SEARCH_STRATEGIES:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"strategy must be one of {sorted(_SEARCH_STRATEGIES)}",
+        )
+    _validate_filters(request.filters)
+    _validate_limit(request.limit, SEARCH_LIMIT_HARD_MAX, "limit")
+    _validate_range(request.snippet_chars, SNIPPET_CHARS_MIN, SNIPPET_CHARS_MAX, "snippet_chars")
+    _validate_bool(request.include_total, "include_total")
+    _validate_cursor(request.cursor)
+    try:
+        return retrieval.search_messages(request)
+    except ValueError as exc:
+        raise ToolError(
+            code=ErrorCode.INVALID_QUERY,
+            message="query could not be parsed",
+        ) from exc
+
+
+def search_messages(request: SearchMessagesInput) -> SearchMessagesOutput | ErrorResponse:
+    return _handle_tool("search_messages", lambda: _search_messages(request))
+
+
+def _fetch_messages(request: FetchMessagesInput) -> FetchMessagesOutput:
+    """Validate public IDs and delegate the bounded message fetch."""
+    if not isinstance(request, FetchMessagesInput):
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="request must be FetchMessagesInput",
+        )
+    parsed_ids = _validate_public_ids(request.ids)
+    _validate_bool(request.include_transcript, "include_transcript")
+    _validate_bool(request.include_links, "include_links")
+    _validate_bool(request.include_reactions, "include_reactions")
+    _validate_range(
+        request.per_message_max_chars,
+        0,
+        FETCH_PER_MESSAGE_MAX_CHARS_HARD_MAX,
+        "per_message_max_chars",
+    )
+    return retrieval.fetch_messages(request, parsed_ids)
+
+
+def fetch_messages(request: FetchMessagesInput) -> FetchMessagesOutput | ErrorResponse:
+    return _handle_tool("fetch_messages", lambda: _fetch_messages(request))
+
+
+def _get_context(request: GetContextInput) -> GetContextOutput:
+    """Validate the bounded context request and delegate retrieval."""
+    if not isinstance(request, GetContextInput):
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="request must be GetContextInput",
+        )
+    parsed_id = _parse_public_id(request.id)
+    _validate_range(request.before, 0, CONTEXT_BEFORE_AFTER_HARD_MAX, "before")
+    _validate_range(request.after, 0, CONTEXT_BEFORE_AFTER_HARD_MAX, "after")
+    _validate_bool(request.same_topic, "same_topic")
+    _validate_bool(request.include_transcripts, "include_transcripts")
+    _validate_range(
+        request.message_max_chars,
+        0,
+        CONTEXT_MESSAGE_MAX_CHARS_HARD_MAX,
+        "message_max_chars",
+    )
+    return retrieval.get_context(request, parsed_id)
+
+
+def get_context(request: GetContextInput) -> GetContextOutput | ErrorResponse:
+    return _handle_tool("get_context", lambda: _get_context(request))

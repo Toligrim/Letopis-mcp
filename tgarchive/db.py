@@ -1,5 +1,6 @@
 import sqlite3
 from pathlib import Path
+from urllib.parse import quote
 
 FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
@@ -91,4 +92,13 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
     _migrate(conn)
+    return conn
+
+
+def connect_readonly(path: Path) -> sqlite3.Connection:
+    """Open an existing SQLite database without permitting writes."""
+    db_uri = f"file:{quote(str(path.resolve()), safe='/')}?mode=ro"
+    conn = sqlite3.connect(db_uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
     return conn

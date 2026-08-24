@@ -85,6 +85,79 @@ chmod +x tg
 вверх папку, где рядом лежат `config.toml` и `archive/` (либо это явно задаётся
 переменной окружения `TG_ROOT`).
 
+## 🤖 Read-only MCP для ChatGPT
+
+Letopis может работать как **read-only MCP retrieval gateway** для ChatGPT:
+сервер использует тот же `data/index.db`, что и обычный поиск, но отдаёт только
+пять безопасных retrieval-инструментов — обзор архива, поиск, агрегаты, выборку
+сообщений и локальный контекст. MCP-процесс не синхронизирует Telegram, не
+скачивает файлы и не меняет индекс.
+
+### Установка и запуск
+
+Установите MCP SDK и тестовые зависимости в окружение движка:
+
+```sh
+.venv/bin/pip install -e ".[mcp,test]"
+```
+
+Запуск через entrypoint:
+
+```sh
+.venv/bin/letopis-mcp
+```
+
+Альтернативная форма — `.venv/bin/python -m tgarchive.mcp.server`. По умолчанию
+сервер слушает `http://127.0.0.1:8765/mcp` и принимает только loopback-адреса.
+Для production задайте стабильный секрет курсоров и путь к индексу в окружении
+процесса, например:
+
+```sh
+export LETOPIS_MCP_DB=/srv/letopis-data/data/index.db
+export LETOPIS_MCP_CURSOR_SECRET='случайный-длинный-секрет'
+.venv/bin/letopis-mcp
+```
+
+### Переменные окружения
+
+| Переменная | По умолчанию | Назначение |
+|---|---:|---|
+| `LETOPIS_MCP_DB` | значение `[general].db` из `config.toml`, обычно `data/index.db` | Путь к SQLite-индексу; относительный путь считается от корня проекта. |
+| `LETOPIS_MCP_CURSOR_SECRET` | нет; временный случайный секрет на процесс | HMAC-SHA256 для непрозрачных курсоров. **Обязателен в production**: без него курсоры не переживают рестарт процесса. |
+| `LETOPIS_MCP_HOST` | `127.0.0.1` | Loopback-адрес bind; приложение отклоняет нелокальные адреса. |
+| `LETOPIS_MCP_PORT` | `8765` | TCP-порт Streamable HTTP endpoint. |
+| `LETOPIS_MCP_LOG_LEVEL` | `INFO` | Уровень структурированных логов (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). |
+| `LETOPIS_MCP_MAX_CONCURRENCY` | `8` | Максимум конкурентных операций с read-only БД. |
+| `LETOPIS_MCP_QUERY_TIMEOUT_SECONDS` | `30.0` | Дедлайн SQLite-запроса и ожидания слота concurrency. |
+| `LETOPIS_MCP_ROLLING_CALLS_MAX` | `60` | Максимум завершённых вызовов в глобальном rolling-окне. |
+| `LETOPIS_MCP_ROLLING_CHARS_MAX` | `250000` | Максимум отданных символов в том же окне. |
+| `LETOPIS_MCP_ROLLING_WINDOW_SECONDS` | `600` | Длина rolling-окна в секундах. |
+
+Rate limit намеренно глобальный для одного процесса: в v1 нет OAuth и
+идентифицированных principals, поэтому это не per-user ACL. MCP читает эти
+переменные как конфигурацию процесса и не загружает `.env` автоматически.
+
+### Подключение к ChatGPT
+
+Рекомендуемая схема не публикует Letopis в интернет напрямую:
+
+```text
+ChatGPT ↔ OpenAI Secure MCP Tunnel ↔ tunnel-client на этом хосте
+                                      ↔ 127.0.0.1:8765/mcp
+```
+
+Конкретные команды и шаги настройки Secure MCP Tunnel зависят от текущего
+OpenAI workspace и актуальной документации OpenAI. Уточните их на момент
+подключения; этот репозиторий не выдумывает непроверенную OAuth/tunnel-команду.
+
+### Безопасность deployment
+
+MCP-процессу нужны только `data/index.db` и необходимые SQLite sidecar-файлы
+`data/index.db-wal` / `data/index.db-shm`. Ему не должны быть доступны
+`.env`, `telegram.session*`, `archive/`, media или manifest. Запускайте сервер
+под отдельным Unix-пользователем с минимальными правами, а синхронизацию и
+индексацию выполняйте отдельным процессом с нужными правами записи.
+
 ---
 
 ## 🗂 Устройство
