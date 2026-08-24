@@ -64,6 +64,29 @@ async def test_official_mcp_client_protocol_contract(synthetic_archive, monkeypa
         output_schema = json.dumps(tools_by_name["search_messages"].output_schema)
         assert "bm25_score" in output_schema
         assert "score_semantics" in output_schema
+        search_output_schema = tools_by_name["search_messages"].output_schema
+        assert isinstance(search_output_schema, dict)
+        error_ref = next(
+            variant["$ref"]
+            for variant in search_output_schema["anyOf"]
+            if variant["$ref"].endswith("/_ErrorWire")
+        )
+        error_schema = search_output_schema["$defs"][error_ref.rsplit("/", 1)[-1]]
+        assert set(error_schema["properties"]) == {"error"}
+        assert error_schema["properties"]["error"]["$ref"].endswith("/ErrorResponse")
+
+        assert tools_by_name["fetch_messages"].input_schema["properties"][
+            "per_message_max_chars"
+        ]["default"] == 6000
+        assert tools_by_name["fetch_messages"].input_schema["properties"][
+            "per_message_max_chars"
+        ]["minimum"] == 1000
+        assert tools_by_name["get_context"].input_schema["properties"][
+            "message_max_chars"
+        ]["default"] == 2000
+        assert tools_by_name["get_context"].input_schema["properties"][
+            "message_max_chars"
+        ]["minimum"] == 500
         for tool in listing.tools:
             assert tool.annotations is not None
             assert tool.annotations.read_only_hint is True
@@ -83,6 +106,27 @@ async def test_official_mcp_client_protocol_contract(synthetic_archive, monkeypa
         assert valid.is_error is False
         assert isinstance(valid.structured_content, dict)
         assert {"schema_version", "hits", "score_semantics"} <= set(valid.structured_content)
+
+        invalid_semantic = await client.call_tool(
+            "search_messages",
+            {"query": "пагинация", "strategy": "diverse", "sort": "oldest"},
+        )
+        assert invalid_semantic.is_error is True
+        assert isinstance(invalid_semantic.structured_content, dict)
+        assert set(invalid_semantic.structured_content) == {"error"}
+        nested_error = invalid_semantic.structured_content["error"]
+        assert {"code", "message", "retryable", "details"} <= set(nested_error)
+        assert not {
+            "code",
+            "message",
+            "retryable",
+            "details",
+        } & set(invalid_semantic.structured_content)
+        content_payload = json.loads(
+            next(item.text for item in invalid_semantic.content if hasattr(item, "text"))
+        )
+        assert set(content_payload) == {"error"}
+        assert content_payload["error"] == nested_error
 
         invalid_calls = [
             await client.call_tool(

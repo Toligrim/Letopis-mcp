@@ -58,7 +58,7 @@ def test_fetch_per_message_cap_truncates_long_transcript_honestly(synthetic_arch
             ids=[public_id],
             include_transcript=True,
             include_links=False,
-            per_message_max_chars=500,
+            per_message_max_chars=1_000,
         ),
         [(chat_id, message_id)],
         conn=synthetic_archive.connection,
@@ -73,5 +73,5 @@ def test_fetch_per_message_cap_truncates_long_transcript_honestly(synthetic_arch
     assert fetched.text == "Короткий текст"
     assert fetched.text_truncated is False
     assert fetched.transcript_original_chars == len(transcript)
-    assert len(fetched.transcript) == 500
+    assert len(fetched.transcript) == 1_000
     assert fetched.transcript_truncated is True

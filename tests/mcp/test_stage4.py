@@ -15,6 +15,8 @@ from tgarchive.mcp.models import (
     ArchiveOverviewInput,
     ErrorCode,
     ErrorResponse,
+    FetchMessagesInput,
+    GetContextInput,
     SearchFilters,
     SearchMessagesInput,
 )
@@ -157,9 +159,9 @@ def _stub_search(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     "filters",
     [
-        SearchFilters(chat_ids=list(range(51))),
-        SearchFilters(topic_ids=list(range(51))),
-        SearchFilters(sender_name="x" * 201),
+        SearchFilters(chat_ids=list(range(21))),
+        SearchFilters(topic_ids=list(range(21))),
+        SearchFilters(sender_name="x" * 121),
         SearchFilters(date_from="2024-01-01T"),
         SearchFilters(date_to="2024-01-01T"),
         SearchFilters(date_from="2024/01"),
@@ -189,7 +191,7 @@ def test_cursor_length_is_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
         SearchMessagesInput(
             query="пагинация",
             strategy="relevance",
-            cursor="x" * 4097,
+            cursor="x" * 2049,
         )
     )
 
@@ -203,11 +205,11 @@ def test_filter_and_cursor_values_at_limits_are_valid(monkeypatch: pytest.Monkey
         SearchMessagesInput(
             query="пагинация",
             strategy="relevance",
-            cursor="x" * 4096,
+            cursor="x" * 2048,
             filters=SearchFilters(
-                chat_ids=list(range(50)),
-                topic_ids=list(range(50)),
-                sender_name="x" * 200,
+                chat_ids=list(range(20)),
+                topic_ids=list(range(20)),
+                sender_name="x" * 120,
                 date_from="2024-01-01",
                 date_to="2024-12-31",
                 media="voice",
@@ -255,15 +257,15 @@ def test_search_schema_exposes_filter_and_cursor_constraints() -> None:
         "any",
         "none",
     }
-    assert filter_schema["properties"]["chat_ids"]["anyOf"][0]["maxItems"] == 50
-    assert filter_schema["properties"]["topic_ids"]["anyOf"][0]["maxItems"] == 50
-    assert filter_schema["properties"]["sender_name"]["anyOf"][0]["maxLength"] == 200
+    assert filter_schema["properties"]["chat_ids"]["anyOf"][0]["maxItems"] == 20
+    assert filter_schema["properties"]["topic_ids"]["anyOf"][0]["maxItems"] == 20
+    assert filter_schema["properties"]["sender_name"]["anyOf"][0]["maxLength"] == 120
     assert filter_schema["properties"]["date_from"]["anyOf"][0]["maxLength"] == 10
     assert (
         filter_schema["properties"]["date_from"]["anyOf"][0]["pattern"]
         == r"^\d{4}(?:-\d{2}){0,2}$"
     )
-    assert schema["properties"]["cursor"]["anyOf"][0]["maxLength"] == 4096
+    assert schema["properties"]["cursor"]["anyOf"][0]["maxLength"] == 2048
 
 
 def test_aggregate_filter_validation_uses_the_same_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -272,9 +274,44 @@ def test_aggregate_filter_validation_uses_the_same_boundary(monkeypatch: pytest.
         AggregateMessagesInput(
             query="пагинация",
             group_by="month",
-            filters=SearchFilters(topic_ids=list(range(51))),
+            filters=SearchFilters(topic_ids=list(range(21))),
         )
     )
 
     assert isinstance(result, ErrorResponse)
     assert result.code is ErrorCode.INVALID_ARGUMENT
+
+
+def test_fetch_and_context_character_minimums_are_enforced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tools.retrieval,
+        "fetch_messages",
+        lambda request, parsed_ids: request,
+    )
+    monkeypatch.setattr(
+        tools.retrieval,
+        "get_context",
+        lambda request, parsed_id: request,
+    )
+
+    valid_fetch = tools.fetch_messages(
+        FetchMessagesInput(ids=["tg:-100:1"], per_message_max_chars=1_000)
+    )
+    invalid_fetch = tools.fetch_messages(
+        FetchMessagesInput(ids=["tg:-100:1"], per_message_max_chars=999)
+    )
+    valid_context = tools.get_context(
+        GetContextInput(id="tg:-100:1", message_max_chars=500)
+    )
+    invalid_context = tools.get_context(
+        GetContextInput(id="tg:-100:1", message_max_chars=499)
+    )
+
+    assert isinstance(valid_fetch, FetchMessagesInput)
+    assert isinstance(invalid_fetch, ErrorResponse)
+    assert invalid_fetch.code is ErrorCode.INVALID_ARGUMENT
+    assert isinstance(valid_context, GetContextInput)
+    assert isinstance(invalid_context, ErrorResponse)
+    assert invalid_context.code is ErrorCode.INVALID_ARGUMENT

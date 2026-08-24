@@ -20,10 +20,10 @@ class RollingRateLimiter:
     """Thread-safe rolling counters for completed retrieval calls.
 
     A call slot is reserved atomically during :meth:`can_start` and released
-    by either :meth:`commit_or_reject` or :meth:`cancel_pending`.  The response
-    character count is committed atomically with the limit check after the
-    callback completes, so a completed response cannot push the rolling window
-    over ``chars_max``.
+    by either :meth:`commit_or_reject` or :meth:`cancel_pending`. Completed
+    calls and accepted response characters have separate rolling windows: a
+    response rejected for characters still consumes one completed-call slot,
+    but does not add to the returned-character total.
     """
 
     def __init__(
@@ -41,12 +41,15 @@ class RollingRateLimiter:
         self.window_seconds = window_seconds
         self._clock = clock
         self._entries: deque[tuple[float, int]] = deque()
+        self._call_entries: deque[float] = deque()
         self._chars = 0
         self._pending_calls = 0
         self._lock = Lock()
 
     def _purge(self, now: float) -> None:
         cutoff = now - self.window_seconds
+        while self._call_entries and self._call_entries[0] <= cutoff:
+            self._call_entries.popleft()
         while self._entries and self._entries[0][0] <= cutoff:
             _, chars = self._entries.popleft()
             self._chars -= chars
@@ -57,7 +60,7 @@ class RollingRateLimiter:
         with self._lock:
             self._purge(now)
             if (
-                len(self._entries) + self._pending_calls >= self.calls_max
+                len(self._call_entries) + self._pending_calls >= self.calls_max
                 or self._chars >= self.chars_max
             ):
                 return False
@@ -81,6 +84,7 @@ class RollingRateLimiter:
             self._purge(now)
             if self._pending_calls > 0:
                 self._pending_calls -= 1
+            self._call_entries.append(now)
             if self._chars + response_chars > self.chars_max:
                 return False
             self._entries.append((now, response_chars))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tgarchive.mcp import retrieval, tools
+from tgarchive.db import connect
 from tgarchive.mcp.models import (
     ErrorCode,
     ErrorResponse,
@@ -91,7 +92,16 @@ def test_fetch_reactions_and_per_message_truncation(
     assert reactions.messages[0].reactions == {"👍": 3, "❤️": 1}
 
     text_case = synthetic_archive.cases["ordinary"][0]
-    max_chars = 24
+    long_text = "Длинный текст для проверки ограничения. " * 80
+    writer = connect(synthetic_archive.path)
+    writer.execute(
+        "UPDATE messages SET text=? WHERE chat_id=? AND message_id=?",
+        (long_text, text_case["chat_id"], text_case["message_id"]),
+    )
+    writer.commit()
+    writer.close()
+
+    max_chars = 1_000
     truncated = _fetch_result(
         monkeypatch,
         synthetic_archive,
@@ -102,8 +112,8 @@ def test_fetch_reactions_and_per_message_truncation(
         ),
     )
     message = truncated.messages[0]
-    assert message.text == text_case["text"][:max_chars]
-    assert message.original_text_chars == len(text_case["text"])
+    assert message.text == long_text[:max_chars]
+    assert message.original_text_chars == len(long_text)
     assert message.text_truncated is True
 
 

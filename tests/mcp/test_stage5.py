@@ -54,3 +54,21 @@ def test_character_commit_is_atomic_for_concurrent_completions():
     assert sorted(results) == [False, True]
     assert limiter._chars == 60
     assert limiter._pending_calls == 0
+
+
+def test_character_rejections_consume_completed_call_window():
+    limiter = RollingRateLimiter(
+        calls_max=3,
+        chars_max=100,
+        window_seconds=600,
+    )
+
+    # The first completed response nearly fills the character window. The
+    # following completions are rejected by chars but must still count calls.
+    assert limiter.can_start() is True
+    assert limiter.commit_or_reject(90) is True
+    for _ in range(2):
+        assert limiter.can_start() is True
+        assert limiter.commit_or_reject(20) is False
+
+    assert limiter.can_start() is False

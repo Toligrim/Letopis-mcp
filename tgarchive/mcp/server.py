@@ -29,6 +29,7 @@ from .models import (
     CONTEXT_BEFORE_DEFAULT,
     CONTEXT_BEFORE_AFTER_HARD_MAX,
     CONTEXT_INCLUDE_TRANSCRIPTS_DEFAULT,
+    CONTEXT_MESSAGE_MAX_CHARS_MIN,
     CONTEXT_MESSAGE_MAX_CHARS_DEFAULT,
     CONTEXT_MESSAGE_MAX_CHARS_HARD_MAX,
     CONTEXT_SAME_TOPIC_DEFAULT,
@@ -38,6 +39,7 @@ from .models import (
     FETCH_INCLUDE_LINKS_DEFAULT,
     FETCH_INCLUDE_REACTIONS_DEFAULT,
     FETCH_INCLUDE_TRANSCRIPT_DEFAULT,
+    FETCH_PER_MESSAGE_MAX_CHARS_MIN,
     FETCH_PER_MESSAGE_MAX_CHARS_DEFAULT,
     FETCH_PER_MESSAGE_MAX_CHARS_HARD_MAX,
     FetchMessagesInput,
@@ -94,23 +96,29 @@ class _ObjectRootSchema:
         return schema
 
 
-class _ArchiveWire(_ObjectRootSchema, RootModel[ArchiveOverviewOutput | ErrorResponse]):
+class _ErrorWire(BaseModel):
+    """Wire-only envelope for the internal flat :class:`ErrorResponse`."""
+
+    error: ErrorResponse
+
+
+class _ArchiveWire(_ObjectRootSchema, RootModel[ArchiveOverviewOutput | _ErrorWire]):
     pass
 
 
-class _SearchWire(_ObjectRootSchema, RootModel[SearchMessagesOutput | ErrorResponse]):
+class _SearchWire(_ObjectRootSchema, RootModel[SearchMessagesOutput | _ErrorWire]):
     pass
 
 
-class _AggregateWire(_ObjectRootSchema, RootModel[AggregateMessagesOutput | ErrorResponse]):
+class _AggregateWire(_ObjectRootSchema, RootModel[AggregateMessagesOutput | _ErrorWire]):
     pass
 
 
-class _FetchWire(_ObjectRootSchema, RootModel[FetchMessagesOutput | ErrorResponse]):
+class _FetchWire(_ObjectRootSchema, RootModel[FetchMessagesOutput | _ErrorWire]):
     pass
 
 
-class _ContextWire(_ObjectRootSchema, RootModel[GetContextOutput | ErrorResponse]):
+class _ContextWire(_ObjectRootSchema, RootModel[GetContextOutput | _ErrorWire]):
     pass
 
 
@@ -199,9 +207,15 @@ _FetchIDs = Annotated[
         description="Shortlist of stable message IDs obtained from search_messages.",
     ),
 ]
-_FetchChars = Annotated[int, Field(ge=0, le=FETCH_PER_MESSAGE_MAX_CHARS_HARD_MAX)]
+_FetchChars = Annotated[
+    int,
+    Field(ge=FETCH_PER_MESSAGE_MAX_CHARS_MIN, le=FETCH_PER_MESSAGE_MAX_CHARS_HARD_MAX),
+]
 _ContextWindow = Annotated[int, Field(ge=0, le=CONTEXT_BEFORE_AFTER_HARD_MAX)]
-_ContextChars = Annotated[int, Field(ge=0, le=CONTEXT_MESSAGE_MAX_CHARS_HARD_MAX)]
+_ContextChars = Annotated[
+    int,
+    Field(ge=CONTEXT_MESSAGE_MAX_CHARS_MIN, le=CONTEXT_MESSAGE_MAX_CHARS_HARD_MAX),
+]
 
 _READ_ONLY_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=True,
@@ -213,7 +227,10 @@ _READ_ONLY_ANNOTATIONS = ToolAnnotations(
 
 def _structured_result(result: Any) -> CallToolResult:
     """Put the typed result in structuredContent and a compact text fallback."""
-    structured = asdict(result)
+    if isinstance(result, ErrorResponse):
+        structured = {"error": asdict(result)}
+    else:
+        structured = asdict(result)
     return CallToolResult(
         content=[
             TextContent(

@@ -19,9 +19,11 @@ from .models import (
     ARCHIVE_LIMIT_HARD_MAX,
     CURSOR_MAX_CHARS,
     CONTEXT_BEFORE_AFTER_HARD_MAX,
+    CONTEXT_MESSAGE_MAX_CHARS_MIN,
     CONTEXT_MESSAGE_MAX_CHARS_HARD_MAX,
     FETCH_IDS_MAX,
     FETCH_IDS_MIN,
+    FETCH_PER_MESSAGE_MAX_CHARS_MIN,
     FETCH_PER_MESSAGE_MAX_CHARS_HARD_MAX,
     SEARCH_LIMIT_HARD_MAX,
     SEARCH_FILTER_DATE_MAX_CHARS,
@@ -531,7 +533,7 @@ def _fetch_messages(request: FetchMessagesInput) -> FetchMessagesOutput:
     _validate_bool(request.include_reactions, "include_reactions")
     _validate_range(
         request.per_message_max_chars,
-        0,
+        FETCH_PER_MESSAGE_MAX_CHARS_MIN,
         FETCH_PER_MESSAGE_MAX_CHARS_HARD_MAX,
         "per_message_max_chars",
     )
@@ -560,7 +562,7 @@ def _get_context(request: GetContextInput) -> GetContextOutput:
     _validate_bool(request.include_transcripts, "include_transcripts")
     _validate_range(
         request.message_max_chars,
-        0,
+        CONTEXT_MESSAGE_MAX_CHARS_MIN,
         CONTEXT_MESSAGE_MAX_CHARS_HARD_MAX,
         "message_max_chars",
     )
