@@ -3,9 +3,12 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
+from types import SimpleNamespace
 
-from tgarchive.db import connect, connect_readonly
+from tgarchive.db import bump_index_revision, connect, connect_readonly
 from tgarchive.mcp import ratelimit, retrieval, tools
+from tgarchive.indexer import _fts_set
+from tgarchive.lemma import Lemmatizer
 from tgarchive.mcp.models import (
     ErrorCode,
     ErrorResponse,
@@ -13,6 +16,14 @@ from tgarchive.mcp.models import (
     SearchMessagesOutput,
 )
 from tgarchive.mcp.ratelimit import RollingRateLimiter
+
+
+def _insert_searchable_message(writer, *, chat_id: int, message_id: int, text: str) -> None:
+    cursor = writer.execute(
+        "INSERT INTO messages(chat_id,message_id,date,text) VALUES(?,?,?,?)",
+        (chat_id, message_id, "2026-01-03T00:00:00", text),
+    )
+    _fts_set(writer, Lemmatizer(), int(cursor.lastrowid), text)
 
 
 def test_query_deadline_interrupts_expensive_sql(
@@ -134,6 +145,59 @@ def test_wal_reader_remains_available_while_writer_transaction_is_open(
         writer.close()
 
 
+def test_search_uses_one_snapshot_when_writer_commits_between_count_and_search(
+    synthetic_archive,
+    monkeypatch,
+):
+    monkeypatch.setattr(retrieval, "_database_path", lambda: synthetic_archive.path)
+
+    seed_writer = connect(synthetic_archive.path)
+    try:
+        _insert_searchable_message(
+            seed_writer,
+            chat_id=-1000000000900,
+            message_id=1,
+            text="уникальный снимок",
+        )
+        bump_index_revision(seed_writer)
+        seed_writer.commit()
+    finally:
+        seed_writer.close()
+
+    real_run_count = retrieval.run_count
+
+    def count_then_commit(*args, **kwargs):
+        total = real_run_count(*args, **kwargs)
+        writer = connect(synthetic_archive.path)
+        try:
+            _insert_searchable_message(
+                writer,
+                chat_id=-1000000000900,
+                message_id=2,
+                text="уникальный снимок",
+            )
+            bump_index_revision(writer)
+            writer.commit()
+        finally:
+            writer.close()
+        return total
+
+    monkeypatch.setattr(retrieval, "run_count", count_then_commit)
+    result = retrieval.search_messages(
+        SearchMessagesInput(
+            query="снимок",
+            strategy="relevance",
+            limit=10,
+            snippet_chars=120,
+            include_total=True,
+        )
+    )
+
+    assert result.total_hits == 1
+    assert result.returned_hits == 1
+    assert [hit.id for hit in result.hits] == ["tg:-1000000000900:1"]
+
+
 def test_global_rolling_call_limit_rejects_before_db_callback(
     synthetic_archive,
     monkeypatch,
@@ -170,10 +234,7 @@ def test_global_rolling_call_limit_rejects_before_db_callback(
     assert callback_calls == 3
 
 
-def test_global_rolling_chars_limit_expires_with_sliding_window(
-    synthetic_archive,
-    monkeypatch,
-):
+def test_global_rolling_chars_limit_expires_with_sliding_window(monkeypatch):
     now = [100.0]
     limiter = RollingRateLimiter(
         calls_max=10,
@@ -182,24 +243,19 @@ def test_global_rolling_chars_limit_expires_with_sliding_window(
         clock=lambda: now[0],
     )
     monkeypatch.setattr(ratelimit, "_LIMITER", limiter)
-    monkeypatch.setattr(retrieval, "_database_path", lambda: synthetic_archive.path)
-    request = SearchMessagesInput(
-        query="пагинация",
-        strategy="relevance",
-        limit=1,
-        snippet_chars=120,
-    )
 
-    first = tools.search_messages(request)
-    blocked = tools.search_messages(request)
-    assert isinstance(first, SearchMessagesOutput)
-    assert first.response_chars > 1
+    def callback():
+        return SimpleNamespace(response_chars=1, truncated=False, total_hits=None)
+
+    first = tools._handle_tool("synthetic", callback)
+    blocked = tools._handle_tool("synthetic", callback)
+    assert first.response_chars == 1
     assert isinstance(blocked, ErrorResponse)
     assert blocked.code == ErrorCode.RETRIEVAL_RATE_LIMITED
 
     now[0] = 111.0
-    after_window = tools.search_messages(request)
-    assert isinstance(after_window, SearchMessagesOutput)
+    after_window = tools._handle_tool("synthetic", callback)
+    assert after_window.response_chars == 1
 
 
 def test_global_rolling_call_limit_admits_only_one_concurrent_call(

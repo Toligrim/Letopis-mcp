@@ -147,11 +147,12 @@ def test_relevance_scores_and_chronological_sorting(synthetic_archive):
         _request("пагинация разнообразия", match_mode="or", limit=50),
         conn=connection,
     )
-    scores = [hit.score for hit in relevance.hits]
+    scores = [hit.bm25_score for hit in relevance.hits]
     assert scores
     assert all(isinstance(score, float) for score in scores)
     assert any(score != 0.0 for score in scores)
     assert scores == sorted(scores)
+    assert relevance.score_semantics
 
     oldest = retrieval.search_messages(
         _request("пагинация", sort="oldest", limit=50),
@@ -159,7 +160,8 @@ def test_relevance_scores_and_chronological_sorting(synthetic_archive):
     )
     oldest_keys = [(hit.date, metadata[hit.id]["db_id"]) for hit in oldest.hits]
     assert oldest_keys == sorted(oldest_keys)
-    assert all(hit.score == 0.0 for hit in oldest.hits)
+    assert all(hit.bm25_score is None for hit in oldest.hits)
+    assert oldest.score_semantics
 
     newest = retrieval.search_messages(
         _request("пагинация", sort="newest", limit=50),
@@ -167,4 +169,5 @@ def test_relevance_scores_and_chronological_sorting(synthetic_archive):
     )
     newest_keys = [(hit.date, metadata[hit.id]["db_id"]) for hit in newest.hits]
     assert newest_keys == sorted(newest_keys, reverse=True)
-    assert all(hit.score == 0.0 for hit in newest.hits)
+    assert all(hit.bm25_score is None for hit in newest.hits)
+    assert newest.score_semantics

@@ -12,13 +12,18 @@ from .models import (
     AGGREGATE_LIMIT_HARD_MAX,
     ARCHIVE_CHAT_IDS_MAX,
     ARCHIVE_LIMIT_HARD_MAX,
+    CURSOR_MAX_CHARS,
     CONTEXT_BEFORE_AFTER_HARD_MAX,
     CONTEXT_MESSAGE_MAX_CHARS_HARD_MAX,
     FETCH_IDS_MAX,
     FETCH_IDS_MIN,
     FETCH_PER_MESSAGE_MAX_CHARS_HARD_MAX,
     SEARCH_LIMIT_HARD_MAX,
+    SEARCH_FILTER_DATE_MAX_CHARS,
+    SEARCH_FILTER_DATE_PATTERN,
+    SEARCH_FILTER_ID_LIST_MAX,
     SEARCH_QUERY_MAX_CHARS,
+    SEARCH_FILTER_SENDER_NAME_MAX_CHARS,
     SNIPPET_CHARS_MAX,
     SNIPPET_CHARS_MIN,
     AggregateMessagesInput,
@@ -30,6 +35,7 @@ from .models import (
     GetContextInput,
     GetContextOutput,
     SearchFilters,
+    MEDIA_FILTER_VALUES,
     SearchMessagesInput,
     SearchMessagesOutput,
     ErrorCode,
@@ -42,6 +48,8 @@ _MATCH_MODES = {"and", "or", "boolean"}
 _GROUP_BY = {"chat", "topic", "sender", "month", "quarter", "year"}
 _SEARCH_SORTS = {"relevance", "oldest", "newest"}
 _SEARCH_STRATEGIES = {"relevance", "diverse"}
+_MEDIA_FILTERS = frozenset(MEDIA_FILTER_VALUES)
+_DATE_FILTER_RE = re.compile(SEARCH_FILTER_DATE_PATTERN)
 _PUBLIC_ID_RE = re.compile(r"^tg:(-?\d+):(\d+)$", re.ASCII)
 ToolResultT = TypeVar("ToolResultT")
 _LOGGER = logging.getLogger("letopis_mcp")
@@ -112,7 +120,15 @@ def _handle_tool(tool_name: str, callback: Callable[[], ToolResultT]) -> ToolRes
     else:
         response_chars = getattr(result, "response_chars", None)
         if isinstance(response_chars, int):
-            ratelimit.record_completed(response_chars)
+            if not ratelimit.commit_or_reject(response_chars):
+                error = ErrorResponse(
+                    code=ErrorCode.RETRIEVAL_RATE_LIMITED,
+                    message="Global retrieval character limit exceeded; retry later",
+                    retryable=True,
+                    details={"scope": "global", "phase": "completion"},
+                )
+                _log_tool_call(tool_name, started, "error", result=error)
+                return error
         else:
             ratelimit.cancel_pending()
         _log_tool_call(tool_name, started, "ok", result=result)
@@ -128,8 +144,15 @@ def _validate_limit(value: int, hard_max: int, field: str) -> None:
 
 
 def _validate_cursor(cursor: str | None) -> None:
-    if cursor is not None and not isinstance(cursor, str):
+    if cursor is None:
+        return
+    if not isinstance(cursor, str):
         raise ToolError(code=ErrorCode.INVALID_ARGUMENT, message="cursor must be a string")
+    if len(cursor) > CURSOR_MAX_CHARS:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"cursor must be at most {CURSOR_MAX_CHARS} characters",
+        )
 
 
 def _validate_bool(value: bool, field: str) -> None:
@@ -184,10 +207,19 @@ def _validate_filters(filters: SearchFilters | None) -> None:
         )
     for name in ("chat_ids", "topic_ids"):
         values = getattr(filters, name)
-        if values is not None and (
-            not isinstance(values, list)
-            or any(isinstance(value, bool) or not isinstance(value, int) for value in values)
-        ):
+        if values is None:
+            continue
+        if not isinstance(values, list):
+            raise ToolError(
+                code=ErrorCode.INVALID_ARGUMENT,
+                message=f"{name} must be a list of integers",
+            )
+        if len(values) > SEARCH_FILTER_ID_LIST_MAX:
+            raise ToolError(
+                code=ErrorCode.INVALID_ARGUMENT,
+                message=f"{name} must contain at most {SEARCH_FILTER_ID_LIST_MAX} IDs",
+            )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
             raise ToolError(
                 code=ErrorCode.INVALID_ARGUMENT,
                 message=f"{name} must be a list of integers",
@@ -196,15 +228,45 @@ def _validate_filters(filters: SearchFilters | None) -> None:
         isinstance(filters.sender_id, bool) or not isinstance(filters.sender_id, int)
     ):
         raise ToolError(code=ErrorCode.INVALID_ARGUMENT, message="sender_id must be an integer")
-    for name in ("sender_name", "date_from", "date_to", "media"):
+    if filters.sender_name is not None:
+        if not isinstance(filters.sender_name, str):
+            raise ToolError(code=ErrorCode.INVALID_ARGUMENT, message="sender_name must be a string")
+        if len(filters.sender_name) > SEARCH_FILTER_SENDER_NAME_MAX_CHARS:
+            raise ToolError(
+                code=ErrorCode.INVALID_ARGUMENT,
+                message=(
+                    f"sender_name must be at most "
+                    f"{SEARCH_FILTER_SENDER_NAME_MAX_CHARS} characters"
+                ),
+            )
+    for name in ("date_from", "date_to"):
         value = getattr(filters, name)
-        if value is not None and not isinstance(value, str):
+        if value is None:
+            continue
+        if not isinstance(value, str):
             raise ToolError(code=ErrorCode.INVALID_ARGUMENT, message=f"{name} must be a string")
+        normalized = value.strip()
+        if (
+            len(normalized) > SEARCH_FILTER_DATE_MAX_CHARS
+            or _DATE_FILTER_RE.fullmatch(normalized) is None
+        ):
+            raise ToolError(
+                code=ErrorCode.INVALID_ARGUMENT,
+                message=f"{name} must use YYYY, YYYY-MM, or YYYY-MM-DD format",
+            )
+    if filters.media is not None:
+        if not isinstance(filters.media, str) or filters.media not in _MEDIA_FILTERS:
+            raise ToolError(
+                code=ErrorCode.INVALID_ARGUMENT,
+                message=f"media must be one of {sorted(_MEDIA_FILTERS)}",
+            )
 
 
 def _validate_chat_ids(chat_ids: list[int] | None) -> None:
     if chat_ids is None:
         return
+    if not isinstance(chat_ids, list):
+        raise ToolError(code=ErrorCode.INVALID_ARGUMENT, message="chat_ids must be a list of integers")
     if len(chat_ids) > ARCHIVE_CHAT_IDS_MAX:
         raise ToolError(
             code=ErrorCode.INVALID_ARGUMENT,
@@ -299,11 +361,23 @@ def _search_messages(request: SearchMessagesInput) -> SearchMessagesOutput:
             code=ErrorCode.INVALID_ARGUMENT,
             message=f"strategy must be one of {sorted(_SEARCH_STRATEGIES)}",
         )
+    if request.strategy == "diverse" and request.sort != "relevance":
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="strategy=diverse only supports sort=relevance",
+            details={"strategy": "diverse", "sort": request.sort},
+        )
     _validate_filters(request.filters)
     _validate_limit(request.limit, SEARCH_LIMIT_HARD_MAX, "limit")
     _validate_range(request.snippet_chars, SNIPPET_CHARS_MIN, SNIPPET_CHARS_MAX, "snippet_chars")
     _validate_bool(request.include_total, "include_total")
     _validate_cursor(request.cursor)
+    if request.strategy == "diverse" and request.cursor is not None:
+        raise ToolError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="strategy=diverse does not support cursor pagination",
+            details={"strategy": "diverse"},
+        )
     try:
         return retrieval.search_messages(request)
     except ValueError as exc:

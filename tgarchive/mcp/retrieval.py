@@ -41,6 +41,7 @@ from .models import (
     SEARCH_CHAT_TOPIC_MAX_RESULTS,
     SEARCH_LOCAL_BURST_MAX_RESULTS,
     SEARCH_RESPONSE_CHARS_HARD_MAX,
+    SEARCH_SCORE_SEMANTICS,
     AggregateMessagesInput,
     AggregateMessagesOutput,
     AggregateGroup,
@@ -169,6 +170,7 @@ def _readonly_connection(conn: sqlite3.Connection | None) -> Iterator[sqlite3.Co
         )
 
     readonly: sqlite3.Connection | None = None
+    transaction_started = False
     deadline_hit = False
     try:
         try:
@@ -185,6 +187,8 @@ def _readonly_connection(conn: sqlite3.Connection | None) -> Iterator[sqlite3.Co
                     max(0, math.floor(timeout_seconds * 1000)),
                 )
             readonly.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            readonly.execute("BEGIN DEFERRED")
+            transaction_started = True
 
             def progress() -> int:
                 nonlocal deadline_hit
@@ -202,6 +206,8 @@ def _readonly_connection(conn: sqlite3.Connection | None) -> Iterator[sqlite3.Co
         if readonly is not None:
             try:
                 readonly.set_progress_handler(None, 0)
+                if transaction_started and readonly.in_transaction:
+                    readonly.execute("ROLLBACK")
             finally:
                 if conn is None:
                     readonly.close()
@@ -234,39 +240,63 @@ def _render_response(response: ResponseEnvelope) -> str:
 def _trim_archive_response(
     response: ArchiveOverviewOutput,
     remove_count: int,
+    *,
+    next_cursor_factory: Callable[[list[ArchiveChat]], str | None] | None = None,
 ) -> ArchiveOverviewOutput:
-    return replace(
+    trimmed = replace(
         response,
         chats=response.chats[:-remove_count],
         returned_chats=max(0, len(response.chats) - remove_count),
         has_more=True,
     )
+    if next_cursor_factory is not None:
+        trimmed = replace(
+            trimmed,
+            next_cursor=next_cursor_factory(trimmed.chats),
+        )
+    return trimmed
 
 
 def _trim_aggregate_response(
     response: AggregateMessagesOutput,
     remove_count: int,
+    *,
+    next_cursor_factory: Callable[[list[AggregateGroup]], str | None] | None = None,
 ) -> AggregateMessagesOutput:
     removed = response.groups[-remove_count:]
-    return replace(
+    trimmed = replace(
         response,
         groups=response.groups[:-remove_count],
         returned_groups=max(0, len(response.groups) - remove_count),
         other_count=response.other_count + sum(group.count for group in removed),
         has_more=True,
     )
+    if next_cursor_factory is not None:
+        trimmed = replace(
+            trimmed,
+            next_cursor=next_cursor_factory(trimmed.groups),
+        )
+    return trimmed
 
 
 def _trim_search_response(
     response: SearchMessagesOutput,
     remove_count: int,
+    *,
+    next_cursor_factory: Callable[[list[SearchHit]], str | None] | None = None,
 ) -> SearchMessagesOutput:
-    return replace(
+    trimmed = replace(
         response,
         hits=response.hits[:-remove_count],
         returned_hits=max(0, len(response.hits) - remove_count),
         has_more=True,
     )
+    if next_cursor_factory is not None:
+        trimmed = replace(
+            trimmed,
+            next_cursor=next_cursor_factory(trimmed.hits),
+        )
+    return trimmed
 
 
 def _trim_fetch_response(
@@ -452,11 +482,34 @@ def archive_overview(
                 )
             )
 
+        def archive_cursor(chats: list[ArchiveChat]) -> str | None:
+            if not chats:
+                return None
+            last_chat = chats[-1]
+            return encode_cursor(
+                query_fingerprint=fingerprint,
+                sort="archive_overview",
+                last_count=last_chat.message_count,
+                last_chat_id=last_chat.chat_id,
+                conn=readonly,
+            )
+
+        def trim_archive_response(
+            response: ArchiveOverviewOutput,
+            remove_count: int,
+        ) -> ArchiveOverviewOutput:
+            return _trim_archive_response(
+                response,
+                remove_count,
+                next_cursor_factory=archive_cursor,
+            )
+
         return _finalize_response(
             ArchiveOverviewOutput,
             hard_max_chars=ARCHIVE_RESPONSE_CHARS_HARD_MAX,
             budget_field="chats",
-            on_truncate=_trim_archive_response,
+            on_truncate=trim_archive_response,
+            preserve_items=1,
             total_messages=int(summary["total_messages"]),
             total_chats=int(summary["total_chats"]),
             date_from=summary["date_from"],
@@ -465,13 +518,7 @@ def archive_overview(
             returned_chats=len(chats),
             has_more=has_more,
             next_cursor=(
-                encode_cursor(
-                    query_fingerprint=fingerprint,
-                    sort="archive_overview",
-                    last_count=int(page[-1]["message_count"]),
-                    last_chat_id=int(page[-1]["chat_id"]),
-                    conn=readonly,
-                )
+                archive_cursor(chats)
                 if has_more and page
                 else None
             ),
@@ -499,6 +546,40 @@ def _search_parts(filters: SearchFilters | None) -> tuple[list[str], list[Any]]:
 
 def _build_match(query: str, match_mode: str) -> str:
     return build_match(query, Lemmatizer(), any_mode=match_mode == "or")
+
+
+def _decode_topic_group_key(key: str | int | None) -> tuple[int, int | None]:
+    """Decode the stable ``chat_id:topic_id`` aggregate wire key."""
+    if not isinstance(key, str):
+        raise ValueError("topic group key must be a string")
+    chat_text, separator, topic_text = key.rpartition(":")
+    if not separator or not chat_text or not topic_text:
+        raise ValueError("invalid topic group key")
+    try:
+        chat_id = int(chat_text)
+        topic_id = None if topic_text == "null" else int(topic_text)
+    except ValueError as exc:
+        raise ValueError("invalid topic group key") from exc
+    return chat_id, topic_id
+
+
+def _topic_group_metadata(
+    conn: sqlite3.Connection,
+    key: str | int | None,
+) -> tuple[int, str, int | None, str | None]:
+    chat_id, topic_id = _decode_topic_group_key(key)
+    row = conn.execute(
+        "SELECT c.title AS chat_title, t.title AS topic_title "
+        "FROM chats c "
+        "LEFT JOIN topics t ON t.chat_id=c.chat_id AND t.topic_id IS ? "
+        "WHERE c.chat_id=?",
+        (topic_id, chat_id),
+    ).fetchone()
+    chat_title = (row["chat_title"] if row else None) or str(chat_id)
+    topic_title = None
+    if topic_id is not None:
+        topic_title = (row["topic_title"] if row else None) or f"топик {topic_id}"
+    return chat_id, chat_title, topic_id, topic_title
 
 
 def aggregate_messages(
@@ -552,20 +633,55 @@ def aggregate_messages(
             if tail_after is not None
             else 0
         )
-        groups = [
-            AggregateGroup(
-                key=row["k"],
-                count=int(row["c"]),
-                date_from=row["d0"],
-                date_to=row["d1"],
+        groups = []
+        for row in page:
+            topic_metadata = (
+                _topic_group_metadata(readonly, row["k"])
+                if request.group_by == "topic"
+                else None
             )
-            for row in page
-        ]
+            groups.append(
+                AggregateGroup(
+                    key=row["k"],
+                    count=int(row["c"]),
+                    date_from=row["d0"],
+                    date_to=row["d1"],
+                    chat_id=topic_metadata[0] if topic_metadata else None,
+                    chat_title=topic_metadata[1] if topic_metadata else None,
+                    topic_id=topic_metadata[2] if topic_metadata else None,
+                    topic_title=topic_metadata[3] if topic_metadata else None,
+                )
+            )
+
+        def aggregate_cursor(groups: list[AggregateGroup]) -> str | None:
+            if not groups:
+                return None
+            last_group = groups[-1]
+            return encode_cursor(
+                query_fingerprint=fingerprint,
+                sort="aggregate",
+                group_by=request.group_by,
+                last_count=last_group.count,
+                last_group_key=last_group.key,
+                conn=readonly,
+            )
+
+        def trim_aggregate_response(
+            response: AggregateMessagesOutput,
+            remove_count: int,
+        ) -> AggregateMessagesOutput:
+            return _trim_aggregate_response(
+                response,
+                remove_count,
+                next_cursor_factory=aggregate_cursor,
+            )
+
         return _finalize_response(
             AggregateMessagesOutput,
             hard_max_chars=AGGREGATE_RESPONSE_CHARS_HARD_MAX,
             budget_field="groups",
-            on_truncate=_trim_aggregate_response,
+            on_truncate=trim_aggregate_response,
+            preserve_items=1,
             total_hits=int(total["c"]),
             group_by=request.group_by,
             groups=groups,
@@ -573,14 +689,7 @@ def aggregate_messages(
             other_count=other_count,
             has_more=has_more,
             next_cursor=(
-                encode_cursor(
-                    query_fingerprint=fingerprint,
-                    sort="aggregate",
-                    group_by=request.group_by,
-                    last_count=int(page[-1]["c"]),
-                    last_group_key=page[-1]["k"],
-                    conn=readonly,
-                )
+                aggregate_cursor(groups)
                 if has_more and page
                 else None
             ),
@@ -615,7 +724,8 @@ def search_messages(
 
     Diversity is intentionally a bounded sampler: it does not expose deep
     offset pagination, so callers should use ``strategy=relevance`` for page
-    two and later.
+    two and later.  When ``include_total`` is false, ``has_more`` remains
+    false because the bounded sampler has no safe total-based signal.
     """
     with _readonly_connection(conn) as readonly:
         lem = Lemmatizer()
@@ -627,6 +737,7 @@ def search_messages(
         if request.include_total:
             total = run_count(readonly, match, cond, params)
             total_hits = int(total["c"])
+        search_cursor_factory: Callable[[list[SearchHit]], str | None] | None = None
 
         if request.strategy == "diverse":
             candidate_pool_size = min(
@@ -651,11 +762,16 @@ def search_messages(
                 local_burst_max=SEARCH_LOCAL_BURST_MAX_RESULTS,
                 chat_topic_max=SEARCH_CHAT_TOPIC_MAX_RESULTS,
             )
-            offset = 0
-            has_more = False
+            # Diverse is deliberately not cursor-paginatable.  When the
+            # total was requested, it is still useful to report that the
+            # bounded sample does not cover all matching rows.  Without a
+            # total there is no safe way to infer this, so remain conservative.
+            has_more = total_hits is not None and total_hits > len(page)
             next_cursor = None
+            pagination_supported = False
             ranked_output = True
         else:
+            pagination_supported = True
             rank = request.sort == "relevance"
             fingerprint = query_fingerprint(
                 request.query,
@@ -715,6 +831,22 @@ def search_messages(
                     last_score=float(last_row["bm25_score"]) if rank else None,
                     last_date=last_row["date"] if not rank else None,
                 )
+
+            def search_cursor(hits: list[SearchHit]) -> str | None:
+                if not hits:
+                    return None
+                last_hit = hits[-1]
+                last_row = page[len(hits) - 1]
+                return encode_cursor(
+                    query_fingerprint=fingerprint,
+                    sort=request.sort,
+                    last_row_id=int(last_row["id"]),
+                    conn=readonly,
+                    last_score=last_hit.bm25_score if rank else None,
+                    last_date=last_hit.date if not rank else None,
+                )
+
+            search_cursor_factory = search_cursor
             ranked_output = rank
 
         metadata = _search_metadata(readonly, page)
@@ -752,7 +884,7 @@ def search_messages(
                     snippet=snippet,
                     snippet_source=snippet_source,
                     matched_terms=matched_terms,
-                    score=float(row["bm25_score"]) if ranked_output else 0.0,
+                    bm25_score=float(row["bm25_score"]) if ranked_output else None,
                     rank=index,
                     media_kind=row["media_kind"],
                     telegram_url=tme_link(chat_id, message_id),
@@ -760,17 +892,30 @@ def search_messages(
                 )
             )
 
+        def trim_search_response(
+            response: SearchMessagesOutput,
+            remove_count: int,
+        ) -> SearchMessagesOutput:
+            return _trim_search_response(
+                response,
+                remove_count,
+                next_cursor_factory=search_cursor_factory,
+            )
+
         return _finalize_response(
             SearchMessagesOutput,
             hard_max_chars=SEARCH_RESPONSE_CHARS_HARD_MAX,
             budget_field="hits",
-            on_truncate=_trim_search_response,
+            on_truncate=trim_search_response,
+            preserve_items=1 if request.strategy != "diverse" else 0,
             original_query=request.query,
             match_mode=request.match_mode,
+            score_semantics=SEARCH_SCORE_SEMANTICS,
             total_hits=total_hits,
             returned_hits=len(hits),
             hits=hits,
             has_more=has_more,
+            pagination_supported=pagination_supported,
             next_cursor=next_cursor,
         )
 

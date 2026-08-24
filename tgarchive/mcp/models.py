@@ -29,6 +29,15 @@ SEARCH_QUERY_MAX_CHARS: Final[int] = 500
 SEARCH_MATCH_MODE_DEFAULT: Final[str] = "and"
 SEARCH_SORT_DEFAULT: Final[str] = "relevance"
 SEARCH_STRATEGY_DEFAULT: Final[str] = "diverse"
+SEARCH_FILTER_ID_LIST_MAX: Final[int] = ARCHIVE_CHAT_IDS_MAX
+SEARCH_FILTER_SENDER_NAME_MAX_CHARS: Final[int] = 200
+SEARCH_FILTER_DATE_MAX_CHARS: Final[int] = 10
+SEARCH_FILTER_DATE_PATTERN: Final[str] = r"^\d{4}(?:-\d{2}){0,2}$"
+CURSOR_MAX_CHARS: Final[int] = 4_096
+SEARCH_SCORE_SEMANTICS: Final[str] = (
+    "SQLite FTS5 BM25; lower is better; not comparable across different queries; "
+    "null when sort does not use relevance ranking."
+)
 SEARCH_LIMIT_DEFAULT: Final[int] = 20
 SEARCH_LIMIT_HARD_MAX: Final[int] = 50
 SNIPPET_CHARS_DEFAULT: Final[int] = 320
@@ -76,8 +85,37 @@ MatchMode = Literal["and", "or", "boolean"]
 SearchSort = Literal["relevance", "oldest", "newest"]
 SearchStrategy = Literal["relevance", "diverse"]
 AggregateGroupBy = Literal["chat", "topic", "sender", "month", "quarter", "year"]
+MediaFilter = Literal[
+    "voice",
+    "audio",
+    "video",
+    "video_note",
+    "sticker",
+    "gif",
+    "document",
+    "photo",
+    "poll",
+    "webpage",
+    "any",
+    "none",
+]
 SnippetSource = Literal["text", "transcript", "poll", "media_name"]
 ContextRelation = Literal["before", "pivot", "after"]
+
+MEDIA_FILTER_VALUES: Final[tuple[str, ...]] = (
+    "voice",
+    "audio",
+    "video",
+    "video_note",
+    "sticker",
+    "gif",
+    "document",
+    "photo",
+    "poll",
+    "webpage",
+    "any",
+    "none",
+)
 
 
 class ErrorCode(str, Enum):
@@ -193,7 +231,7 @@ class SearchFilters:
     sender_name: str | None = None
     date_from: str | None = None
     date_to: str | None = None
-    media: str | None = None
+    media: MediaFilter | None = None
 
 
 @dataclass(slots=True)
@@ -224,7 +262,7 @@ class SearchHit:
     snippet: str
     snippet_source: SnippetSource
     matched_terms: list[str]
-    score: float
+    bm25_score: float | None
     rank: int
     media_kind: str | None
     telegram_url: str | None
@@ -235,10 +273,12 @@ class SearchHit:
 class SearchMessagesOutput(ResponseEnvelope):
     original_query: str
     match_mode: MatchMode
+    score_semantics: str
     total_hits: int | None
     returned_hits: int
     hits: list[SearchHit]
     has_more: bool
+    pagination_supported: bool
     next_cursor: str | None
 
 
@@ -262,6 +302,10 @@ class AggregateGroup:
     count: int
     date_from: str | None
     date_to: str | None
+    chat_id: int | None = None
+    chat_title: str | None = None
+    topic_id: int | None = None
+    topic_title: str | None = None
 
 
 @dataclass(slots=True)

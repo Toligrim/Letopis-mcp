@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from tgarchive.db import connect
+from tgarchive.db import bump_index_revision, connect, connect_readonly
 from tgarchive.mcp import retrieval, tools
 from tgarchive.mcp.cursor import (
     CURSOR_TTL_SECONDS,
@@ -113,6 +113,7 @@ def test_stale_and_expired_cursors_are_rejected_on_synthetic_db(synthetic_archiv
         "INSERT INTO messages(chat_id,message_id,date,text) VALUES(?,?,?,?)",
         (-1000000000002, 900, "2026-01-01T00:00:00", "изменение индекса"),
     )
+    bump_index_revision(writer)
     writer.commit()
     writer.close()
 
@@ -141,3 +142,55 @@ def test_stale_and_expired_cursors_are_rejected_on_synthetic_db(synthetic_archiv
             conn=connection,
         )
     assert expiry.value.code == ErrorCode.INVALID_CURSOR
+
+
+def test_stale_cursor_is_detected_after_connection_replacement(synthetic_archive):
+    first = connect_readonly(synthetic_archive.path)
+    try:
+        first_page = retrieval.search_messages(_ordinary_request(), conn=first)
+        cursor = first_page.next_cursor
+    finally:
+        first.close()
+    assert cursor
+
+    writer = connect(synthetic_archive.path)
+    try:
+        writer.execute(
+            "INSERT INTO messages(chat_id,message_id,date,text) VALUES(?,?,?,?)",
+            (-1000000000002, 901, "2026-01-02T00:00:00", "изменение индекса"),
+        )
+        bump_index_revision(writer)
+        writer.commit()
+    finally:
+        writer.close()
+
+    second = connect_readonly(synthetic_archive.path)
+    try:
+        with pytest.raises(CursorError) as stale:
+            retrieval.search_messages(_ordinary_request(cursor), conn=second)
+        assert stale.value.code == ErrorCode.STALE_CURSOR
+    finally:
+        second.close()
+
+
+def test_cursor_continues_with_a_fresh_connection_without_index_changes(synthetic_archive):
+    first = connect_readonly(synthetic_archive.path)
+    try:
+        first_page = retrieval.search_messages(_ordinary_request(), conn=first)
+    finally:
+        first.close()
+    assert first_page.next_cursor
+
+    second = connect_readonly(synthetic_archive.path)
+    try:
+        second_page = retrieval.search_messages(
+            _ordinary_request(first_page.next_cursor),
+            conn=second,
+        )
+    finally:
+        second.close()
+
+    assert second_page.total_hits == first_page.total_hits == 50
+    assert {hit.id for hit in first_page.hits}.isdisjoint(
+        {hit.id for hit in second_page.hits}
+    )

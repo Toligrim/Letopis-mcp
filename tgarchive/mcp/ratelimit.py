@@ -20,10 +20,10 @@ class RollingRateLimiter:
     """Thread-safe rolling counters for completed retrieval calls.
 
     A call slot is reserved atomically during :meth:`can_start` and released
-    by either :meth:`record_completed` or :meth:`cancel_pending`.  This keeps
-    the calls limit effective when several MCP worker threads arrive at once;
-    response characters remain post-hoc because their final size is not known
-    until the callback has completed.
+    by either :meth:`commit_or_reject` or :meth:`cancel_pending`.  The response
+    character count is committed atomically with the limit check after the
+    callback completes, so a completed response cannot push the rolling window
+    over ``chars_max``.
     """
 
     def __init__(
@@ -72,8 +72,8 @@ class RollingRateLimiter:
             if self._pending_calls > 0:
                 self._pending_calls -= 1
 
-    def record_completed(self, response_chars: int) -> None:
-        """Record a successful completed call after its response is finalized."""
+    def commit_or_reject(self, response_chars: int) -> bool:
+        """Atomically commit a completed response if its character budget fits."""
         if response_chars < 0:
             raise ValueError("response_chars must be non-negative")
         now = self._clock()
@@ -81,8 +81,15 @@ class RollingRateLimiter:
             self._purge(now)
             if self._pending_calls > 0:
                 self._pending_calls -= 1
+            if self._chars + response_chars > self.chars_max:
+                return False
             self._entries.append((now, response_chars))
             self._chars += response_chars
+            return True
+
+    def record_completed(self, response_chars: int) -> None:
+        """Compatibility wrapper for callers that do not inspect acceptance."""
+        self.commit_or_reject(response_chars)
 
 
 _CONFIG_LOCK = Lock()
@@ -133,6 +140,10 @@ def can_start() -> bool:
 
 def record_completed(response_chars: int) -> None:
     _get_limiter().record_completed(response_chars)
+
+
+def commit_or_reject(response_chars: int) -> bool:
+    return _get_limiter().commit_or_reject(response_chars)
 
 
 def cancel_pending() -> None:

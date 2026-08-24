@@ -4,6 +4,7 @@ import sys
 import time
 from pathlib import Path
 
+from .db import bump_index_revision
 from .lemma import Lemmatizer, normalize
 
 CHAT_DIR_RE = re.compile(r"^-?\d+$")
@@ -72,6 +73,7 @@ def rebuild_fts(conn, lem=None):
         if n % 100000 == 0:
             print(f"  fts: {n}...", file=sys.stderr)
     conn.execute("DELETE FROM kv WHERE k='fts_dirty'")
+    bump_index_revision(conn)
     conn.commit()
 
 
@@ -148,6 +150,7 @@ def index_archive(conn, archive_dir: Path, rebuild: bool = False) -> int:
 
         conn.executescript("DELETE FROM messages; DELETE FROM files; DROP TABLE IF EXISTS fts;")
         conn.executescript(SCHEMA)
+        bump_index_revision(conn)
         conn.commit()
 
     lem = Lemmatizer()
@@ -197,6 +200,7 @@ def index_archive(conn, archive_dir: Path, rebuild: bool = False) -> int:
             "lines_done=files.lines_done+?, mtime=excluded.mtime",
             (rel, pos, added, f.stat().st_mtime, added),
         )
+        bump_index_revision(conn)
         conn.commit()
         total += added
         if added:

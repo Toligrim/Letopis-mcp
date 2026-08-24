@@ -25,7 +25,13 @@ def _expected_counts(synthetic_archive):
     )
     return {
         "chat": {work_chat_id: 46, other_chat_ids[0]: 5, other_chat_ids[1]: 5},
-        "topic": {101: 31, None: 15, 202: 10},
+        "topic": {
+            f"{work_chat_id}:101": 31,
+            f"{work_chat_id}:202": 10,
+            f"{work_chat_id}:null": 5,
+            f"{other_chat_ids[0]}:null": 5,
+            f"{other_chat_ids[1]}:null": 5,
+        },
         "sender": {"Алиса": 19, "Борис": 19, "Вера": 18},
         "month": {
             "2024-03": 16,
@@ -58,8 +64,11 @@ def test_all_aggregate_groupings_match_fixture_distribution(synthetic_archive):
         assert result.other_count == 0
 
     topic_result = _aggregate(synthetic_archive, "topic")
-    general = next(group for group in topic_result.groups if group.key is None)
-    assert general.count == 15
+    work_chat_id = synthetic_archive.cases["ordinary"][0]["chat_id"]
+    general = next(
+        group for group in topic_result.groups if group.key == f"{work_chat_id}:null"
+    )
+    assert general.count == 5
 
 
 def test_aggregate_other_count_is_the_exact_tail_sum(synthetic_archive):

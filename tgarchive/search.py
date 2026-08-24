@@ -28,6 +28,13 @@ MEDIA_ALIASES = {
     "contact": "MessageMediaContact",
 }
 
+# Values produced by records.classify_media().  Polls and web pages are
+# intentionally handled separately below because classify_media() returns
+# None for both of them.
+MEDIA_KIND_FILTERS = frozenset(
+    {"voice", "audio", "video", "video_note", "sticker", "gif", "document", "photo"}
+)
+
 
 def _phrase_expression(words: tuple[str, ...], lemmas: tuple[str, ...]) -> str:
     orig = " ".join(w.lower() for w in words)
@@ -174,13 +181,30 @@ def where_filters(chat_ids=None, topic=None, sender=None, date_from=None, date_t
     if date_to:
         cond.append("m.date<?")
         params.append(date_to_bound(date_to))
-    if media == "any":
-        cond.append("m.media_type IS NOT NULL")
-    elif media == "none":
-        cond.append("m.media_type IS NULL")
-    elif media:
+    media_name = media.lower() if isinstance(media, str) else media
+    if media_name == "any":
+        cond.append(
+            "(m.media_type IS NOT NULL OR m.media_kind IS NOT NULL OR m.poll IS NOT NULL)"
+        )
+    elif media_name == "none":
+        cond.append(
+            "(m.media_type IS NULL AND m.media_kind IS NULL AND m.poll IS NULL)"
+        )
+    elif media_name in MEDIA_KIND_FILTERS:
+        cond.append("m.media_kind=?")
+        params.append(media_name)
+    elif media_name == "poll":
+        cond.append("m.poll IS NOT NULL")
+    elif media_name == "webpage":
+        # Web pages have no media_kind in classify_media(); media_type is the
+        # only reliable discriminator retained in the index.
         cond.append("m.media_type=?")
-        params.append(MEDIA_ALIASES.get(media.lower(), media))
+        params.append(MEDIA_ALIASES["webpage"])
+    elif media:
+        # Keep the low-level helper's legacy media_type fallback for callers
+        # outside MCP.  MCP validation only permits the explicit enum above.
+        cond.append("m.media_type=?")
+        params.append(MEDIA_ALIASES.get(media_name, media))
     return cond, params
 
 
@@ -236,7 +260,9 @@ def run_count(conn, match, cond, params):
 
 GROUP_COLS = {
     "chat": "m.chat_id",
-    "topic": "m.topic_id",
+    # Telegram topic IDs are scoped to a chat.  Keep a scalar wire key for
+    # the generic group/pagination SQL while encoding both dimensions.
+    "topic": "CAST(m.chat_id AS TEXT) || ':' || COALESCE(CAST(m.topic_id AS TEXT), 'null')",
     "sender": "coalesce(m.sender_name, m.sender_id)",
     "month": "substr(m.date, 1, 7)",
     "quarter": "substr(m.date, 1, 4) || '-Q' || ((CAST(substr(m.date, 6, 2) AS INTEGER) - 1) / 3 + 1)",

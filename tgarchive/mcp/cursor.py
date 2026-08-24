@@ -18,6 +18,7 @@ import sqlite3
 import time
 from typing import Any, Mapping
 
+from ..db import read_index_revision
 from .models import ErrorCode, ToolError
 
 
@@ -90,8 +91,7 @@ def _b64url_decode(value: Any) -> bytes:
 
 
 def _index_signature(conn: sqlite3.Connection) -> int:
-    row = conn.execute("PRAGMA data_version").fetchone()
-    return int(row[0])
+    return read_index_revision(conn)
 
 
 def _filter_value(filters: Any, name: str) -> Any:

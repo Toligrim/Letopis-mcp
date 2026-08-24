@@ -84,6 +84,22 @@ def _migrate(conn: sqlite3.Connection):
     conn.commit()
 
 
+def bump_index_revision(conn: sqlite3.Connection) -> None:
+    """Increment the committed revision observed by read-only retrieval."""
+    conn.execute(
+        "INSERT INTO kv(k, v) VALUES('index_revision', '1') "
+        "ON CONFLICT(k) DO UPDATE SET v=CAST(kv.v AS INTEGER) + 1"
+    )
+
+
+def read_index_revision(readonly_conn: sqlite3.Connection) -> int:
+    """Return the current index revision, or zero for an older database."""
+    row = readonly_conn.execute(
+        "SELECT v FROM kv WHERE k='index_revision'"
+    ).fetchone()
+    return 0 if row is None else int(row[0])
+
+
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
@@ -100,5 +116,6 @@ def connect_readonly(path: Path) -> sqlite3.Connection:
     db_uri = f"file:{quote(str(path.resolve()), safe='/')}?mode=ro"
     conn = sqlite3.connect(db_uri, uri=True)
     conn.row_factory = sqlite3.Row
+    conn.isolation_level = None
     conn.execute("PRAGMA query_only=ON")
     return conn

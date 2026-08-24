@@ -3,6 +3,8 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .db import bump_index_revision
+
 ENV_API_ID = ("TG_RAG_TELEGRAM_API_ID", "TELEGRAM_API_ID", "API_ID")
 ENV_API_HASH = ("TG_RAG_TELEGRAM_API_HASH", "TELEGRAM_API_HASH", "API_HASH")
 ENV_SESSION = ("TG_RAG_SESSION_PATH", "TELEGRAM_SESSION_PATH")
@@ -136,6 +138,7 @@ def meta_sync(root, cfg, conn, chat_ids, account=None):
                     last = r.topics[-1]
                     offset_topic = last.id
                     offset_id = getattr(last, "top_message", 0)
+            bump_index_revision(conn)
             conn.commit()
             out.append(f"{cid}: «{title}» ({kind}), топиков: {n_topics}")
         return out
