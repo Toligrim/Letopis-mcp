@@ -1,3 +1,8 @@
 .venv/
 __pycache__/
 *.pyc
+*.session
+*.session-journal
+.env
+archive/
+data/index.db

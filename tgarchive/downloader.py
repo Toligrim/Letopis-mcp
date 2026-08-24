@@ -87,7 +87,9 @@ class ChatWriter:
         self.media += 1
 
     def write_transcript(self, rec):
-        self._handle("transcripts.jsonl").write(self._dumps(rec))
+        h = self._handle("transcripts.jsonl")
+        h.write(self._dumps(rec))
+        h.flush()
 
     def close(self):
         for h in self._handles.values():

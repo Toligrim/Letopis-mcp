@@ -20,16 +20,22 @@ def make_client(root: Path, cfg: dict, account: str | None = None):
     from dotenv import load_dotenv
 
     load_dotenv(root / ".env")
-    api_id = _env_first(ENV_API_ID)
-    api_hash = _env_first(ENV_API_HASH)
+
+    name = account or "default"
+    acc_cfg = cfg.get("accounts", {}).get(name)
+    # запись аккаунта — либо просто путь к сессии (str), либо таблица
+    # {session=..., api_id=..., api_hash=...} для аккаунта со своим приложением
+    cfg_session = acc_cfg if isinstance(acc_cfg, str) else (acc_cfg or {}).get("session")
+    api_id = (acc_cfg or {}).get("api_id") if isinstance(acc_cfg, dict) else None
+    api_hash = (acc_cfg or {}).get("api_hash") if isinstance(acc_cfg, dict) else None
+    api_id = api_id or _env_first(ENV_API_ID)
+    api_hash = api_hash or _env_first(ENV_API_HASH)
     if not api_id or not api_hash:
         raise SystemExit("В .env не найдены TG_RAG_TELEGRAM_API_ID / TG_RAG_TELEGRAM_API_HASH")
 
-    name = account or "default"
     candidates = []
     if name == "default" and _env_first(ENV_SESSION):
         candidates.append(_env_first(ENV_SESSION))
-    cfg_session = cfg.get("accounts", {}).get(name)
     if cfg_session:
         candidates.append(cfg_session)
     if not candidates:

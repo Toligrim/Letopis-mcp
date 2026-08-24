@@ -5,6 +5,7 @@ import os
 import sys
 
 from . import manifest as MF
+from .indexer import index_archive
 
 PROVIDERS = ("whisper-local", "openai", "telegram", "edge")
 
@@ -97,11 +98,12 @@ def run_transcribe(root, cfg, conn, provider_name=None, chat_id=None, limit=50,
     if provider_name not in PROVIDERS:
         raise SystemExit(f"Неизвестный провайдер «{provider_name}»; доступны: {', '.join(PROVIDERS)}")
 
-    rows = pick_rows(conn, chat_id, limit)
-    if not rows:
-        print("Нет нерасшифрованных голосовых/кружков (сначала скачай: tg media --media voice)",
-              file=sys.stderr)
-        return 0
+    if provider_name != "telegram":
+        rows = pick_rows(conn, chat_id, limit)
+        if not rows:
+            print("Нет нерасшифрованных голосовых/кружков (сначала скачай: tg media --media voice)",
+                  file=sys.stderr)
+            return 0
 
     from .downloader import ChatWriter
 
@@ -131,28 +133,55 @@ def run_transcribe(root, cfg, conn, provider_name=None, chat_id=None, limit=50,
         async def run():
             nonlocal done
             from telethon.tl.functions.messages import TranscribeAudioRequest
+            from telethon.tl.types import InputMessagesFilterVoice, InputMessagesFilterRoundVideo
 
             async with client:
                 if not await client.is_user_authorized():
                     raise SystemExit(f"Сессия «{account}» не авторизована")
-                for r in rows:
-                    try:
-                        res = await client(TranscribeAudioRequest(peer=r["chat_id"], msg_id=r["message_id"]))
-                        for _ in range(30):
-                            if not res.pending:
+
+                if chat_id:
+                    chat_ids = [chat_id]
+                else:
+                    chat_ids = [r["chat_id"] for r in
+                                conn.execute("SELECT DISTINCT chat_id FROM messages")]
+
+                for cid in chat_ids:
+                    entity = await client.get_entity(cid)
+                    already = {r["message_id"] for r in conn.execute(
+                        "SELECT message_id FROM messages WHERE chat_id=? AND transcript IS NOT NULL", (cid,))}
+
+                    candidates = []
+                    for flt in (InputMessagesFilterVoice, InputMessagesFilterRoundVideo):
+                        async for m in client.iter_messages(entity, filter=flt):
+                            if m.id in already:
+                                continue
+                            candidates.append(m.id)
+                            if limit and len(candidates) >= limit:
                                 break
-                            await asyncio.sleep(2)
-                            res = await client(TranscribeAudioRequest(peer=r["chat_id"], msg_id=r["message_id"]))
-                        text = (res.text or "").strip()
-                    except Exception as e:
-                        if "PREMIUM" in str(e).upper():
-                            raise SystemExit("Транскрипция Telegram доступна только Premium-аккаунтам — "
-                                             "используй whisper-local или openai")
-                        print(f"  !! #{r['message_id']}: {e}", file=sys.stderr)
-                        continue
-                    if text:
-                        store(r["chat_id"], r["message_id"], text)
-                        done += 1
+                        if limit and len(candidates) >= limit:
+                            break
+
+                    for mid in candidates:
+                        try:
+                            res = await client(TranscribeAudioRequest(peer=entity, msg_id=mid))
+                            for _ in range(30):
+                                if not res.pending:
+                                    break
+                                await asyncio.sleep(2)
+                                res = await client(TranscribeAudioRequest(peer=entity, msg_id=mid))
+                            text = (res.text or "").strip()
+                        except Exception as e:
+                            if "PREMIUM" in str(e).upper():
+                                raise SystemExit("Транскрипция Telegram доступна только Premium-аккаунтам — "
+                                                 "используй whisper-local или openai")
+                            print(f"  !! #{mid}: {e}", file=sys.stderr)
+                            continue
+                        if text:
+                            store(cid, mid, text)
+                            done += 1
+                            if done % 15 == 0:
+                                writer(cid).close()
+                                index_archive(conn, root / cfg["general"].get("archive_dir", "archive"))
 
         asyncio.run(run())
     else:
@@ -175,7 +204,5 @@ def run_transcribe(root, cfg, conn, provider_name=None, chat_id=None, limit=50,
 
     for w in writers.values():
         w.close()
-    from .indexer import index_archive
-
     index_archive(conn, root / cfg["general"].get("archive_dir", "archive"))
     return done
