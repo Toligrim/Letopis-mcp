@@ -7,3 +7,4 @@ __pycache__/
 archive/
 data/
 config.toml
+.mcp-planning/
