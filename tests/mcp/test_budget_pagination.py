@@ -37,7 +37,7 @@ def test_search_cursor_follows_last_hit_after_budget_truncation(
     expected = _collect_search_ids(request, synthetic_archive.connection)
     default_cap = retrieval.SEARCH_RESPONSE_CHARS_HARD_MAX
 
-    monkeypatch.setattr(retrieval, "SEARCH_RESPONSE_CHARS_HARD_MAX", 1_000)
+    monkeypatch.setattr(retrieval, "SEARCH_RESPONSE_CHARS_HARD_MAX", 1_800)
     first = retrieval.search_messages(request, conn=synthetic_archive.connection)
     assert first.truncated is True
     assert first.has_more is True
@@ -73,7 +73,7 @@ def test_aggregate_cursor_follows_last_group_after_budget_truncation(
     ]
     default_cap = retrieval.AGGREGATE_RESPONSE_CHARS_HARD_MAX
 
-    monkeypatch.setattr(retrieval, "AGGREGATE_RESPONSE_CHARS_HARD_MAX", 700)
+    monkeypatch.setattr(retrieval, "AGGREGATE_RESPONSE_CHARS_HARD_MAX", 1_000)
     first = retrieval.aggregate_messages(request, conn=synthetic_archive.connection)
     assert first.truncated is True
     assert first.has_more is True
@@ -105,7 +105,7 @@ def test_archive_cursor_follows_last_chat_after_budget_truncation(
     ]
     default_cap = retrieval.ARCHIVE_RESPONSE_CHARS_HARD_MAX
 
-    monkeypatch.setattr(retrieval, "ARCHIVE_RESPONSE_CHARS_HARD_MAX", 900)
+    monkeypatch.setattr(retrieval, "ARCHIVE_RESPONSE_CHARS_HARD_MAX", 1_400)
     first = retrieval.archive_overview(request, conn=synthetic_archive.connection)
     assert first.truncated is True
     assert first.has_more is True

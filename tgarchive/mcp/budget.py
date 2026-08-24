@@ -61,7 +61,8 @@ def enforce_budget(
     the callback chooses which edge messages to remove.  If the immutable
     portion of a response alone exceeds a cap, no list-only implementation can
     reduce it further; the bounded loop returns a truthful ``truncated``
-    response in that pathological case.
+    response, and the retrieval caller converts that overflow into a
+    structured ``OUTPUT_BUDGET_EXCEEDED`` error.
     """
     if hard_max_chars < 0:
         raise ValueError("hard_max_chars must be non-negative")

@@ -12,14 +12,17 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import sqlite3
+import threading
 import time
 from typing import Any, Mapping
 
 from ..db import read_index_revision
 from .models import ErrorCode, ToolError
+from .settings import SettingsError
 
 
 CURSOR_VERSION = 1
@@ -37,13 +40,51 @@ _FILTER_FIELDS = (
     "media",
 )
 
-_configured_secret = os.environ.get("LETOPIS_MCP_CURSOR_SECRET")
-if _configured_secret:
-    _CURSOR_SECRET = _configured_secret.encode("utf-8")
-else:
-    # Temporary dev fallback: cursors intentionally do not survive a process
-    # restart without LETOPIS_MCP_CURSOR_SECRET. Stage 6 adds full config.
-    _CURSOR_SECRET = secrets.token_bytes(32)
+_CURSOR_SECRET: bytes | None = None
+_CURSOR_CONFIG_MODE: str | None = None
+_CURSOR_CONFIG_LOCK = threading.Lock()
+_CURSOR_LOGGER = logging.getLogger("letopis_mcp.cursor")
+
+
+def configure_cursor_secret(*, dev_mode: bool) -> None:
+    """Configure the cursor signing key once during MCP startup."""
+    global _CURSOR_SECRET, _CURSOR_CONFIG_MODE
+
+    configured_secret = os.environ.get("LETOPIS_MCP_CURSOR_SECRET")
+    if configured_secret:
+        desired_mode = "explicit"
+        desired_secret = configured_secret.encode("utf-8")
+    elif dev_mode:
+        desired_mode = "dev"
+        desired_secret = None
+    else:
+        raise SettingsError(
+            "LETOPIS_MCP_CURSOR_SECRET is required unless LETOPIS_MCP_DEV_MODE=true"
+        )
+
+    with _CURSOR_CONFIG_LOCK:
+        if _CURSOR_CONFIG_MODE is not None:
+            if desired_mode == "explicit" and _CURSOR_SECRET == desired_secret:
+                return
+            if desired_mode == "dev" and _CURSOR_CONFIG_MODE == "dev":
+                return
+            raise RuntimeError("cursor secret is already configured with different settings")
+
+        if desired_mode == "dev":
+            _CURSOR_SECRET = secrets.token_bytes(32)
+            _CURSOR_LOGGER.warning(
+                "LETOPIS_MCP_CURSOR_SECRET is unset; using an ephemeral cursor secret; "
+                "cursors will not survive a process restart"
+            )
+        else:
+            _CURSOR_SECRET = desired_secret
+        _CURSOR_CONFIG_MODE = desired_mode
+
+
+def _require_cursor_secret() -> bytes:
+    if _CURSOR_SECRET is None:
+        raise SettingsError("cursor secret is not configured; initialize the MCP server first")
+    return _CURSOR_SECRET
 
 
 class CursorError(ToolError):
@@ -210,7 +251,7 @@ def encode_cursor(
         payload["last_chat_id"] = last_chat_id
 
     serialized = _canonical_json(payload)
-    signature = hmac.new(_CURSOR_SECRET, serialized, hashlib.sha256).digest()
+    signature = hmac.new(_require_cursor_secret(), serialized, hashlib.sha256).digest()
     return f"{_b64url_encode(serialized)}.{_b64url_encode(signature)}"
 
 
@@ -228,7 +269,7 @@ def decode_cursor(
     encoded_payload, encoded_signature = token.split(".", 1)
     serialized = _b64url_decode(encoded_payload)
     provided_signature = _b64url_decode(encoded_signature)
-    expected_signature = hmac.new(_CURSOR_SECRET, serialized, hashlib.sha256).digest()
+    expected_signature = hmac.new(_require_cursor_secret(), serialized, hashlib.sha256).digest()
     if not hmac.compare_digest(provided_signature, expected_signature):
         _invalid("invalid cursor signature")
     if len(provided_signature) != hashlib.sha256().digest_size:

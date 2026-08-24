@@ -8,9 +8,10 @@ from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
-from pydantic import BaseModel, Field, RootModel, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, RootModel, StringConstraints
 
 from . import ratelimit, tools as retrieval_tools
+from .cursor import configure_cursor_secret
 from .models import (
     AGGREGATE_LIMIT_DEFAULT,
     AGGREGATE_LIMIT_HARD_MAX,
@@ -143,6 +144,8 @@ _Cursor = Annotated[str | None, Field(max_length=CURSOR_MAX_CHARS)]
 class _SearchFiltersWire(BaseModel):
     """Constrained MCP input shape converted to the stdlib SearchFilters model."""
 
+    model_config = ConfigDict(extra="forbid")
+
     chat_ids: _FilterIDs | None = None
     topic_ids: _FilterIDs | None = None
     sender_id: int | None = None
@@ -189,6 +192,25 @@ def _coerce_search_filters(
     if filters is None or isinstance(filters, SearchFilters):
         return filters
     return SearchFilters(**filters.model_dump())
+
+
+def _forbid_tool_extras(server: MCPServer, tool_name: str) -> None:
+    """Make SDK-generated argument models reject unknown JSON fields.
+
+    MCP 2.0.0's ``Tool.from_function`` builds a dynamic model with
+    ``ArgModelBase`` and caches its JSON schema in ``Tool.parameters``.  The
+    SDK does not expose an ``extra`` option on ``add_tool``, so update the
+    registered model and cached schema immediately after registration.
+    """
+    registered = server._tool_manager.get_tool(tool_name)  # type: ignore[reportPrivateUsage]
+    if registered is None:  # pragma: no cover - registration failure is exceptional
+        raise RuntimeError(f"MCP tool was not registered: {tool_name}")
+    argument_model = registered.fn_metadata.arg_model
+    model_config = dict(argument_model.model_config)
+    model_config["extra"] = "forbid"
+    argument_model.model_config = ConfigDict(**model_config)
+    argument_model.model_rebuild(force=True)
+    registered.parameters = argument_model.model_json_schema()
 
 
 def archive_overview(
@@ -294,6 +316,8 @@ def get_context(
 def create_server(settings: MCPSettings | None = None) -> MCPServer:
     """Create the stateless MCP server and register only retrieval tools."""
     runtime = settings or load_settings()
+    configure_logging(runtime.log_level)
+    configure_cursor_secret(dev_mode=runtime.dev_mode)
     retrieval_tools.retrieval.configure_runtime(runtime)
     ratelimit.configure_runtime(runtime)
     server = MCPServer(
@@ -302,7 +326,6 @@ def create_server(settings: MCPSettings | None = None) -> MCPServer:
         instructions=SERVER_INSTRUCTIONS,
         log_level=runtime.log_level,
     )
-    configure_logging(runtime.log_level)
     for tool in (
         archive_overview,
         search_messages,
@@ -315,6 +338,7 @@ def create_server(settings: MCPSettings | None = None) -> MCPServer:
             annotations=_READ_ONLY_ANNOTATIONS,
             structured_output=True,
         )
+        _forbid_tool_extras(server, tool.__name__)
     return server
 
 

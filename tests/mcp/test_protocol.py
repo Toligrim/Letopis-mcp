@@ -46,6 +46,11 @@ async def test_official_mcp_client_protocol_contract(synthetic_archive, monkeypa
             "get_context",
         }
         assert all(tool.input_schema for tool in listing.tools)
+        assert all(tool.input_schema.get("additionalProperties") is False for tool in listing.tools)
+        search_input_schema = tools_by_name["search_messages"].input_schema
+        filter_ref = search_input_schema["properties"]["filters"]["anyOf"][0]["$ref"]
+        filter_schema = search_input_schema["$defs"][filter_ref.rsplit("/", 1)[-1]]
+        assert filter_schema["additionalProperties"] is False
         output_schema = json.dumps(tools_by_name["search_messages"].output_schema)
         assert "bm25_score" in output_schema
         assert "score_semantics" in output_schema
@@ -69,9 +74,20 @@ async def test_official_mcp_client_protocol_contract(synthetic_archive, monkeypa
         assert isinstance(valid.structured_content, dict)
         assert {"schema_version", "hits", "score_semantics"} <= set(valid.structured_content)
 
-        invalid = await client.call_tool("search_messages", {})
-        assert invalid.is_error is True
-        assert invalid.content
-        error_text = " ".join(getattr(item, "text", "") for item in invalid.content)
-        assert error_text
-        assert "Traceback" not in error_text
+        invalid_calls = [
+            await client.call_tool(
+                "search_messages",
+                {"query": "пагинация", "bogus_argument": "x"},
+            ),
+            await client.call_tool(
+                "search_messages",
+                {"query": "пагинация", "filters": {"bogus_filter_key": "x"}},
+            ),
+            await client.call_tool("search_messages", {}),
+        ]
+        for invalid in invalid_calls:
+            assert invalid.is_error is True
+            assert invalid.content
+            error_text = " ".join(getattr(item, "text", "") for item in invalid.content)
+            assert error_text
+            assert "Traceback" not in error_text

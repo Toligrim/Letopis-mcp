@@ -11,6 +11,7 @@ import pytest
 from tgarchive.db import connect, connect_readonly
 from tgarchive.indexer import _fts_set, compose_index_text
 from tgarchive.lemma import Lemmatizer
+from tgarchive.mcp.cursor import configure_cursor_secret
 
 
 WORK_CHAT_ID = -1000000000001
@@ -369,10 +370,13 @@ def _populate_archive(path: Path) -> None:
     writable.close()
 
 @pytest.fixture
-def synthetic_archive(tmp_path: Path):
+def synthetic_archive(tmp_path: Path, monkeypatch):
     """Build an isolated synthetic archive and expose a read-only snapshot."""
     db_path = tmp_path / "synthetic-index.db"
     _populate_archive(db_path)
+    monkeypatch.setenv("LETOPIS_MCP_DB", str(db_path))
+    monkeypatch.setenv("LETOPIS_MCP_CURSOR_SECRET", "synthetic-test-cursor-secret")
+    configure_cursor_secret(dev_mode=False)
     readonly = connect_readonly(db_path)
     archive = SyntheticArchive(
         path=db_path,

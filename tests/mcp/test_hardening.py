@@ -127,7 +127,7 @@ def test_wal_reader_remains_available_while_writer_transaction_is_open(
                 busy_timeout = connection.execute(
                     "PRAGMA busy_timeout"
                 ).fetchone()[0]
-            assert busy_timeout == retrieval.BUSY_TIMEOUT_MS
+                assert 0 < busy_timeout <= retrieval.BUSY_TIMEOUT_MS
         finally:
             probe.close()
 

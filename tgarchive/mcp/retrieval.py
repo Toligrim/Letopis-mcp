@@ -35,6 +35,7 @@ from .models import (
     CONTENT_TRUST_UNTRUSTED_USER_GENERATED,
     CONTEXT_RESPONSE_CHARS_HARD_MAX,
     FETCH_RESPONSE_CHARS_HARD_MAX,
+    METADATA_STRING_MAX_CHARS,
     SEARCH_CANDIDATE_POOL_MAX,
     SEARCH_CANDIDATE_POOL_MIN,
     SEARCH_CANDIDATE_POOL_MULTIPLIER,
@@ -77,8 +78,50 @@ ResponseT = TypeVar("ResponseT", bound=ResponseEnvelope)
 _RUNTIME_LOCK = threading.Lock()
 _DB_SEMAPHORE: threading.BoundedSemaphore | None = None
 _QUERY_TIMEOUT_SECONDS: float | None = None
+_CONFIGURED_QUERY_TIMEOUT_SECONDS: float | None = None
+_TOOL_TIMEOUTS: dict[str, float] | None = None
 _DB_PATH: Path | None = None
-_RUNTIME_KEY: tuple[int, float, Path] | None = None
+_RUNTIME_KEY: tuple[object, ...] | None = None
+
+
+_TOOL_TIMEOUT_FIELDS = {
+    "archive_overview": "archive_timeout_seconds",
+    "search_messages": "search_timeout_seconds",
+    "aggregate_messages": "aggregate_timeout_seconds",
+    "fetch_messages": "fetch_timeout_seconds",
+    "get_context": "context_timeout_seconds",
+}
+
+
+def _tool_timeout_values(settings: MCPSettings) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for tool_name, field_name in _TOOL_TIMEOUT_FIELDS.items():
+        configured = getattr(settings, field_name)
+        values[tool_name] = (
+            settings.query_timeout_seconds if configured is None else configured
+        )
+    return values
+
+
+def _runtime_key(settings: MCPSettings, tool_timeouts: dict[str, float]) -> tuple[object, ...]:
+    return (
+        settings.max_concurrency,
+        settings.query_timeout_seconds,
+        settings.db_path,
+        tuple(sorted(tool_timeouts.items())),
+    )
+
+
+def _install_runtime(settings: MCPSettings) -> None:
+    global _DB_PATH, _DB_SEMAPHORE, _QUERY_TIMEOUT_SECONDS
+    global _CONFIGURED_QUERY_TIMEOUT_SECONDS, _TOOL_TIMEOUTS, _RUNTIME_KEY
+    tool_timeouts = _tool_timeout_values(settings)
+    _DB_SEMAPHORE = threading.BoundedSemaphore(settings.max_concurrency)
+    _QUERY_TIMEOUT_SECONDS = settings.query_timeout_seconds
+    _CONFIGURED_QUERY_TIMEOUT_SECONDS = settings.query_timeout_seconds
+    _TOOL_TIMEOUTS = tool_timeouts
+    _DB_PATH = settings.db_path
+    _RUNTIME_KEY = _runtime_key(settings, tool_timeouts)
 
 
 def _database_path() -> Path:
@@ -89,41 +132,35 @@ def _database_path() -> Path:
 
 def configure_runtime(settings: MCPSettings) -> None:
     """Install process-wide DB hardening limits during server startup."""
-    global _DB_PATH, _DB_SEMAPHORE, _QUERY_TIMEOUT_SECONDS, _RUNTIME_KEY
-    runtime_key = (
-        settings.max_concurrency,
-        settings.query_timeout_seconds,
-        settings.db_path,
-    )
+    runtime_key = _runtime_key(settings, _tool_timeout_values(settings))
     with _RUNTIME_LOCK:
         if _RUNTIME_KEY is not None:
             if runtime_key != _RUNTIME_KEY:
                 raise RuntimeError("MCP runtime is already configured")
             return
-        _DB_SEMAPHORE = threading.BoundedSemaphore(settings.max_concurrency)
-        _QUERY_TIMEOUT_SECONDS = settings.query_timeout_seconds
-        _DB_PATH = settings.db_path
-        _RUNTIME_KEY = runtime_key
+        _install_runtime(settings)
 
 
-def _runtime_limits() -> tuple[threading.BoundedSemaphore, float]:
+def _runtime_limits(tool_name: str | None = None) -> tuple[threading.BoundedSemaphore, float]:
     global _DB_PATH, _DB_SEMAPHORE, _QUERY_TIMEOUT_SECONDS, _RUNTIME_KEY
+    global _CONFIGURED_QUERY_TIMEOUT_SECONDS, _TOOL_TIMEOUTS
     if _DB_SEMAPHORE is None or _QUERY_TIMEOUT_SECONDS is None:
         with _RUNTIME_LOCK:
             if _DB_SEMAPHORE is None or _QUERY_TIMEOUT_SECONDS is None:
                 settings = load_settings()
-                _DB_SEMAPHORE = threading.BoundedSemaphore(settings.max_concurrency)
-                _QUERY_TIMEOUT_SECONDS = settings.query_timeout_seconds
-                _DB_PATH = settings.db_path
-                _RUNTIME_KEY = (
-                    settings.max_concurrency,
-                    settings.query_timeout_seconds,
-                    settings.db_path,
-                )
+                _install_runtime(settings)
     # The guarded initialization above sets both values together.
     assert _DB_SEMAPHORE is not None
     assert _QUERY_TIMEOUT_SECONDS is not None
-    return _DB_SEMAPHORE, _QUERY_TIMEOUT_SECONDS
+    # Existing tests and operators may override the legacy global timeout at
+    # runtime; honor that explicit override for compatibility.
+    if (
+        _CONFIGURED_QUERY_TIMEOUT_SECONDS is None
+        or _QUERY_TIMEOUT_SECONDS != _CONFIGURED_QUERY_TIMEOUT_SECONDS
+        or _TOOL_TIMEOUTS is None
+    ):
+        return _DB_SEMAPHORE, _QUERY_TIMEOUT_SECONDS
+    return _DB_SEMAPHORE, _TOOL_TIMEOUTS.get(tool_name or "", _QUERY_TIMEOUT_SECONDS)
 
 
 def _is_busy_error(error: sqlite3.OperationalError) -> bool:
@@ -159,10 +196,23 @@ def _raise_sqlite_tool_error(
 
 
 @contextmanager
-def _readonly_connection(conn: sqlite3.Connection | None) -> Iterator[sqlite3.Connection]:
+def _readonly_connection(
+    conn: sqlite3.Connection | None,
+    *,
+    tool_name: str | None = None,
+) -> Iterator[sqlite3.Connection]:
     """Serialize and deadline a DB operation; supplied connections are thread-owned."""
-    semaphore, timeout_seconds = _runtime_limits()
-    if not semaphore.acquire(timeout=max(0.0, timeout_seconds)):
+    entered_at = time.monotonic()
+    semaphore, timeout_seconds = _runtime_limits(tool_name)
+    deadline = entered_at + max(0.0, timeout_seconds)
+    if not semaphore.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise ToolError(
+            code=ErrorCode.QUERY_TIMEOUT,
+            message="The archive database concurrency wait exceeded its deadline",
+            retryable=True,
+        )
+    if time.monotonic() >= deadline:
+        semaphore.release()
         raise ToolError(
             code=ErrorCode.QUERY_TIMEOUT,
             message="The archive database concurrency wait exceeded its deadline",
@@ -175,17 +225,25 @@ def _readonly_connection(conn: sqlite3.Connection | None) -> Iterator[sqlite3.Co
     try:
         try:
             readonly = conn if conn is not None else connect_readonly(_database_path())
-            opened_at = time.monotonic()
-            deadline = opened_at + timeout_seconds
+            if time.monotonic() >= deadline:
+                raise ToolError(
+                    code=ErrorCode.QUERY_TIMEOUT,
+                    message="The archive query exceeded its deadline",
+                    retryable=True,
+                )
 
             readonly.execute("PRAGMA query_only=ON")
-            if timeout_seconds <= 0:
-                busy_timeout_ms = 0
-            else:
-                busy_timeout_ms = min(
-                    BUSY_TIMEOUT_MS,
-                    max(0, math.floor(timeout_seconds * 1000)),
+            remaining_seconds = max(0.0, deadline - time.monotonic())
+            if remaining_seconds <= 0:
+                raise ToolError(
+                    code=ErrorCode.QUERY_TIMEOUT,
+                    message="The archive query exceeded its deadline",
+                    retryable=True,
                 )
+            busy_timeout_ms = min(
+                BUSY_TIMEOUT_MS,
+                math.floor(remaining_seconds * 1000),
+            )
             readonly.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
             readonly.execute("BEGIN DEFERRED")
             transaction_started = True
@@ -235,6 +293,20 @@ def _encode_offset(offset: int) -> str:
 
 def _render_response(response: ResponseEnvelope) -> str:
     return json.dumps(asdict(response), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _metadata_text(value: Any) -> str | None:
+    """Bound archive-provided metadata before it enters a response envelope."""
+    if value is None:
+        return None
+    return str(value)[:METADATA_STRING_MAX_CHARS]
+
+
+def _metadata_value(value: Any) -> Any:
+    """Bound string-valued metadata while preserving numeric group keys."""
+    if isinstance(value, str):
+        return value[:METADATA_STRING_MAX_CHARS]
+    return value
 
 
 def _trim_archive_response(
@@ -353,7 +425,7 @@ def _finalize_response(
     if hard_max_chars is not None:
         if budget_field is None or on_truncate is None:
             raise ValueError("budget_field and on_truncate are required with a hard cap")
-        return enforce_budget(
+        bounded = enforce_budget(
             response,
             hard_max_chars,
             budget_field,
@@ -361,6 +433,20 @@ def _finalize_response(
             render=_render_response,
             preserve_items=preserve_items,
         )
+        if bounded.response_chars > hard_max_chars:
+            raise ToolError(
+                code=ErrorCode.OUTPUT_BUDGET_EXCEEDED,
+                message=(
+                    "The response cannot fit within the output character budget; "
+                    "retry with fewer or smaller result fields"
+                ),
+                retryable=True,
+                details={
+                    "hard_max_chars": hard_max_chars,
+                    "response_chars": bounded.response_chars,
+                },
+            )
+        return bounded
     for _ in range(8):
         rendered = _render_response(response)
         chars = len(rendered)
@@ -401,18 +487,18 @@ def _topic_rows(conn: sqlite3.Connection, chat_id: int) -> list[ArchiveTopic]:
     topics = []
     for row in rows:
         topic_id = row["topic_id"]
-        title = row["title"]
+        title = _metadata_text(row["title"])
         if topic_id is None:
-            title = "General (без топика)"
+            title = _metadata_text("General (без топика)")
         elif not title:
-            title = f"топик {topic_id}"
+            title = _metadata_text(f"топик {topic_id}")
         topics.append(
             ArchiveTopic(
                 topic_id=topic_id,
                 title=title,
                 message_count=int(row["message_count"]),
-                date_from=row["date_from"],
-                date_to=row["date_to"],
+                date_from=_metadata_text(row["date_from"]),
+                date_to=_metadata_text(row["date_to"]),
             )
         )
     return topics
@@ -423,7 +509,7 @@ def archive_overview(
     conn: sqlite3.Connection | None = None,
 ) -> ArchiveOverviewOutput:
     """Return bounded archive/chat metadata using a read-only connection."""
-    with _readonly_connection(conn) as readonly:
+    with _readonly_connection(conn, tool_name="archive_overview") as readonly:
         scope, params = _chat_scope(request.chat_ids)
         where = f" WHERE {scope}" if scope else ""
         summary = readonly.execute(
@@ -473,10 +559,10 @@ def archive_overview(
             chats.append(
                 ArchiveChat(
                     chat_id=chat_id,
-                    title=row["title"] or str(chat_id),
+                    title=_metadata_text(row["title"] or str(chat_id)) or str(chat_id),
                     message_count=int(row["message_count"]),
-                    date_from=row["date_from"],
-                    date_to=row["date_to"],
+                    date_from=_metadata_text(row["date_from"]),
+                    date_to=_metadata_text(row["date_to"]),
                     topic_count=int(row["topic_count"] or 0),
                     topics=topics,
                 )
@@ -512,8 +598,8 @@ def archive_overview(
             preserve_items=1,
             total_messages=int(summary["total_messages"]),
             total_chats=int(summary["total_chats"]),
-            date_from=summary["date_from"],
-            date_to=summary["date_to"],
+            date_from=_metadata_text(summary["date_from"]),
+            date_to=_metadata_text(summary["date_to"]),
             chats=chats,
             returned_chats=len(chats),
             has_more=has_more,
@@ -575,10 +661,12 @@ def _topic_group_metadata(
         "WHERE c.chat_id=?",
         (topic_id, chat_id),
     ).fetchone()
-    chat_title = (row["chat_title"] if row else None) or str(chat_id)
+    chat_title = _metadata_text((row["chat_title"] if row else None) or str(chat_id))
     topic_title = None
     if topic_id is not None:
-        topic_title = (row["topic_title"] if row else None) or f"топик {topic_id}"
+        topic_title = _metadata_text(
+            (row["topic_title"] if row else None) or f"топик {topic_id}"
+        )
     return chat_id, chat_title, topic_id, topic_title
 
 
@@ -587,7 +675,7 @@ def aggregate_messages(
     conn: sqlite3.Connection | None = None,
 ) -> AggregateMessagesOutput:
     """Return FTS coverage grouped by the requested dimension."""
-    with _readonly_connection(conn) as readonly:
+    with _readonly_connection(conn, tool_name="aggregate_messages") as readonly:
         match = _build_match(request.query, request.match_mode)
         cond, params = _search_parts(request.filters)
         total = run_count(readonly, match, cond, params)
@@ -642,10 +730,10 @@ def aggregate_messages(
             )
             groups.append(
                 AggregateGroup(
-                    key=row["k"],
+                    key=_metadata_value(row["k"]),
                     count=int(row["c"]),
-                    date_from=row["d0"],
-                    date_to=row["d1"],
+                    date_from=_metadata_text(row["d0"]),
+                    date_to=_metadata_text(row["d1"]),
                     chat_id=topic_metadata[0] if topic_metadata else None,
                     chat_title=topic_metadata[1] if topic_metadata else None,
                     topic_id=topic_metadata[2] if topic_metadata else None,
@@ -657,12 +745,17 @@ def aggregate_messages(
             if not groups:
                 return None
             last_group = groups[-1]
+            # Keep the raw SQL key in the opaque cursor.  The wire key may be
+            # capped for sender groups, but keyset pagination must compare the
+            # original value to avoid collisions or skipped groups.
+            group_index = len(groups) - 1
+            raw_group_key = page[group_index]["k"] if group_index < len(page) else last_group.key
             return encode_cursor(
                 query_fingerprint=fingerprint,
                 sort="aggregate",
                 group_by=request.group_by,
                 last_count=last_group.count,
-                last_group_key=last_group.key,
+                last_group_key=raw_group_key,
                 conn=readonly,
             )
 
@@ -727,7 +820,7 @@ def search_messages(
     two and later.  When ``include_total`` is false, ``has_more`` remains
     false because the bounded sampler has no safe total-based signal.
     """
-    with _readonly_connection(conn) as readonly:
+    with _readonly_connection(conn, tool_name="search_messages") as readonly:
         lem = Lemmatizer()
         any_mode = request.match_mode == "or"
         query_groups = parse_query_groups(request.query, lem, any_mode=any_mode)
@@ -843,7 +936,7 @@ def search_messages(
                     last_row_id=int(last_row["id"]),
                     conn=readonly,
                     last_score=last_hit.bm25_score if rank else None,
-                    last_date=last_hit.date if not rank else None,
+                    last_date=last_row["date"] if not rank else None,
                 )
 
             search_cursor_factory = search_cursor
@@ -855,11 +948,11 @@ def search_messages(
             chat_id = int(row["chat_id"])
             message_id = int(row["message_id"])
             meta = metadata.get(int(row["id"]))
-            chat_title = (meta["chat_title"] if meta else None) or str(chat_id)
+            chat_title = _metadata_text((meta["chat_title"] if meta else None) or str(chat_id))
             topic_id = row["topic_id"]
-            topic_title = meta["topic_title"] if meta else None
+            topic_title = _metadata_text(meta["topic_title"] if meta else None)
             if topic_id is not None and not topic_title:
-                topic_title = f"топик {topic_id}"
+                topic_title = _metadata_text(f"топик {topic_id}")
             snippet, snippet_source, matched_terms = build_snippet(
                 query_groups,
                 text=row["text"],
@@ -877,16 +970,16 @@ def search_messages(
                     topic_id=topic_id,
                     topic_title=topic_title,
                     message_id=message_id,
-                    date=row["date"],
+                    date=_metadata_text(row["date"]) or "",
                     sender_id=row["sender_id"],
-                    sender=row["sender_name"],
+                    sender=_metadata_text(row["sender_name"]),
                     reply_to=row["reply_to"],
                     snippet=snippet,
                     snippet_source=snippet_source,
                     matched_terms=matched_terms,
                     bm25_score=float(row["bm25_score"]) if ranked_output else None,
                     rank=index,
-                    media_kind=row["media_kind"],
+                    media_kind=_metadata_text(row["media_kind"]),
                     telegram_url=tme_link(chat_id, message_id),
                     content_trust=CONTENT_TRUST_UNTRUSTED_USER_GENERATED,
                 )
@@ -940,7 +1033,7 @@ def _links_value(value: Any) -> list[str]:
     parsed = _json_value(value)
     if not isinstance(parsed, list):
         return []
-    return [str(item) for item in parsed]
+    return [str(item)[:METADATA_STRING_MAX_CHARS] for item in parsed]
 
 
 def _fetch_message(row: sqlite3.Row, request: FetchMessagesInput) -> FetchedMessage:
@@ -963,10 +1056,10 @@ def _fetch_message(row: sqlite3.Row, request: FetchMessagesInput) -> FetchedMess
 
     return FetchedMessage(
         id=f"tg:{chat_id}:{int(row['message_id'])}",
-        chat=(row["chat_title"] or str(chat_id)),
-        topic=topic,
-        date=row["date"],
-        sender=row["sender_name"],
+        chat=_metadata_text(row["chat_title"] or str(chat_id)),
+        topic=_metadata_text(topic),
+        date=_metadata_text(row["date"]) or "",
+        sender=_metadata_text(row["sender_name"]),
         reply_to=row["reply_to"],
         text=text,
         original_text_chars=original_text_chars,
@@ -975,8 +1068,8 @@ def _fetch_message(row: sqlite3.Row, request: FetchMessagesInput) -> FetchedMess
         transcript_original_chars=transcript_original,
         transcript_truncated=transcript_truncated,
         poll=_json_value(row["poll"]),
-        media_kind=row["media_kind"],
-        media_name=row["media_name"],
+        media_kind=_metadata_text(row["media_kind"]),
+        media_name=_metadata_text(row["media_name"]),
         links=_links_value(row["links"]) if request.include_links else None,
         content_trust=CONTENT_TRUST_UNTRUSTED_USER_GENERATED,
         reactions=_json_value(row["reactions"]) if request.include_reactions else None,
@@ -989,7 +1082,7 @@ def fetch_messages(
     conn: sqlite3.Connection | None = None,
 ) -> FetchMessagesOutput:
     """Fetch a bounded, ordered shortlist with one read-only SQL query."""
-    with _readonly_connection(conn) as readonly:
+    with _readonly_connection(conn, tool_name="fetch_messages") as readonly:
         clauses = ["(m.chat_id=? AND m.message_id=?)" for _ in parsed_ids]
         params: list[int] = []
         for chat_id, message_id in parsed_ids:
@@ -1061,8 +1154,8 @@ def _context_message(
         message_id=message_id,
         topic_id=row["topic_id"],
         relation=relation,
-        date=row["date"],
-        sender=row["sender_name"],
+        date=_metadata_text(row["date"]) or "",
+        sender=_metadata_text(row["sender_name"]),
         text=text,
         transcript=transcript,
     )
@@ -1074,7 +1167,7 @@ def get_context(
     conn: sqlite3.Connection | None = None,
 ) -> GetContextOutput:
     """Return a bounded local context window around a public message ID."""
-    with _readonly_connection(conn) as readonly:
+    with _readonly_connection(conn, tool_name="get_context") as readonly:
         chat_id, message_id = parsed_id
         rows_before, pivot, rows_after = context_rows(
             readonly,
