@@ -82,6 +82,7 @@ _CONFIGURED_QUERY_TIMEOUT_SECONDS: float | None = None
 _TOOL_TIMEOUTS: dict[str, float] | None = None
 _DB_PATH: Path | None = None
 _RUNTIME_KEY: tuple[object, ...] | None = None
+_DIAGNOSTICS_LOCAL = threading.local()
 
 
 _TOOL_TIMEOUT_FIELDS = {
@@ -91,6 +92,88 @@ _TOOL_TIMEOUT_FIELDS = {
     "fetch_messages": "fetch_timeout_seconds",
     "get_context": "context_timeout_seconds",
 }
+
+
+def reset_diagnostics() -> None:
+    """Start a fresh per-thread diagnostics record for one public tool call."""
+    _DIAGNOSTICS_LOCAL.fields = {}
+
+
+def _set_diagnostic(name: str, value: object) -> None:
+    fields = getattr(_DIAGNOSTICS_LOCAL, "fields", None)
+    if fields is None:
+        fields = {}
+        _DIAGNOSTICS_LOCAL.fields = fields
+    fields[name] = value
+
+
+def take_diagnostics() -> dict[str, object]:
+    """Return and clear diagnostics so they cannot leak into the next call."""
+    fields = dict(getattr(_DIAGNOSTICS_LOCAL, "fields", {}))
+    _DIAGNOSTICS_LOCAL.fields = {}
+    return fields
+
+
+class _TimedCursor:
+    """Proxy a SQLite cursor and account for execution/fetch time only."""
+
+    def __init__(self, cursor: sqlite3.Cursor, connection: "_TimedConnection") -> None:
+        self._cursor = cursor
+        self._connection = connection
+
+    def fetchone(self) -> sqlite3.Row | tuple[Any, ...] | None:
+        return self._connection._measure(self._cursor.fetchone)
+
+    def fetchall(self) -> list[sqlite3.Row | tuple[Any, ...]]:
+        return self._connection._measure(self._cursor.fetchall)
+
+    def fetchmany(self, size: int | None = None) -> list[sqlite3.Row | tuple[Any, ...]]:
+        if size is None:
+            return self._connection._measure(self._cursor.fetchmany)
+        return self._connection._measure(self._cursor.fetchmany, size)
+
+    def __iter__(self) -> "_TimedCursor":
+        return self
+
+    def __next__(self) -> sqlite3.Row | tuple[Any, ...]:
+        return self._connection._measure(self._cursor.__next__)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+
+class _TimedConnection:
+    """Keep SQL timing out of response data while preserving DB-API access."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+        self.elapsed_seconds = 0.0
+
+    def _measure(self, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        started = time.perf_counter()
+        try:
+            return operation(*args, **kwargs)
+        finally:
+            self.elapsed_seconds += time.perf_counter() - started
+
+    def execute(self, *args: Any, **kwargs: Any) -> _TimedCursor:
+        cursor = self._measure(self._connection.execute, *args, **kwargs)
+        return _TimedCursor(cursor, self)
+
+    def executemany(self, *args: Any, **kwargs: Any) -> _TimedCursor:
+        cursor = self._measure(self._connection.executemany, *args, **kwargs)
+        return _TimedCursor(cursor, self)
+
+    def executescript(self, *args: Any, **kwargs: Any) -> _TimedCursor:
+        cursor = self._measure(self._connection.executescript, *args, **kwargs)
+        return _TimedCursor(cursor, self)
+
+    def cursor(self, *args: Any, **kwargs: Any) -> _TimedCursor:
+        cursor = self._measure(self._connection.cursor, *args, **kwargs)
+        return _TimedCursor(cursor, self)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
 
 
 def _tool_timeout_values(settings: MCPSettings) -> dict[str, float]:
@@ -219,12 +302,14 @@ def _readonly_connection(
             retryable=True,
         )
 
-    readonly: sqlite3.Connection | None = None
+    raw_readonly: sqlite3.Connection | None = None
+    readonly: _TimedConnection | None = None
     transaction_started = False
     deadline_hit = False
     try:
         try:
-            readonly = conn if conn is not None else connect_readonly(_database_path())
+            raw_readonly = conn if conn is not None else connect_readonly(_database_path())
+            readonly = _TimedConnection(raw_readonly)
             if time.monotonic() >= deadline:
                 raise ToolError(
                     code=ErrorCode.QUERY_TIMEOUT,
@@ -267,8 +352,12 @@ def _readonly_connection(
                 if transaction_started and readonly.in_transaction:
                     readonly.execute("ROLLBACK")
             finally:
-                if conn is None:
-                    readonly.close()
+                _set_diagnostic(
+                    "sql_time_ms",
+                    round(readonly.elapsed_seconds * 1000, 3),
+                )
+                if conn is None and raw_readonly is not None:
+                    raw_readonly.close()
         semaphore.release()
 
 
@@ -849,6 +938,7 @@ def search_messages(
                 rank=True,
                 include_score=True,
             )
+            _set_diagnostic("candidate_pool_size", len(candidates))
             page = select_diverse(
                 candidates,
                 request.limit,
@@ -911,6 +1001,7 @@ def search_messages(
                 )
                 ordered = list(candidates)
 
+            _set_diagnostic("candidate_pool_size", len(ordered))
             page = ordered[:request.limit]
             has_more = len(ordered) > request.limit
             next_cursor = None
