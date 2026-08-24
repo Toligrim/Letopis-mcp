@@ -5,4 +5,5 @@ __pycache__/
 *.session-journal
 .env
 archive/
-data/index.db
+data/
+config.toml

@@ -1,0 +1,45 @@
+# Конфигурация tgarchive. Все пути — относительно корня проекта.
+# Скопируй в config.toml и заполни своими значениями. config.toml в .gitignore —
+# он живёт только локально / в приватном репозитории с данными.
+
+[general]
+archive_dir = "archive"
+db = "data/index.db"
+
+# Псевдонимы чатов: tg search ... --chat myalias
+[aliases]
+myalias = -1000000000000
+
+# Telegram-аккаунты: имя -> файл сессии.
+# Для аккаунта "default" путь к сессии берётся из .env (TG_RAG_SESSION_PATH),
+# если он там задан. Новый аккаунт: добавь строку и запусти `tg login --account <имя>`.
+[accounts]
+default = "telegram.session"
+
+# Дополнительный аккаунт (например, Premium — нужен для tg transcribe --provider telegram).
+# Своё приложение (api_id/api_hash с https://my.telegram.org), т.к. сессия
+# логинится не через .env.
+[accounts.premium]
+session = "telegram_premium.session"
+api_id = 0
+api_hash = "your-api-hash-here"
+
+[web]                  # локальный веб-просмотрщик: tg web
+port = 8377
+
+[media]                # что качать по умолчанию у НОВЫХ чатов (tg download без --media)
+photos = false         # переопределяется: tg download/sync --media photo,voice | all | none
+documents = false
+voice = false
+video_notes = false
+video = false
+stickers = false
+gifs = false
+audio = false
+max_file_mb = 50       # файлы крупнее пропускаются
+
+[transcription]        # tg transcribe — расшифровка голосовых/кружков в текст (попадает в поиск)
+provider = "whisper-local"   # whisper-local (бесплатно, локально) | telegram (нужен Premium) | openai
+whisper_model = "small"      # tiny | base | small | medium | large-v3 (точнее = медленнее)
+language = "ru"
+openai_model = "whisper-1"
