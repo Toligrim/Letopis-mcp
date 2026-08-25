@@ -139,16 +139,139 @@ Rate limit намеренно глобальный для одного проц�
 
 ### Подключение к ChatGPT
 
-Рекомендуемая схема не публикует Letopis в интернет напрямую:
+Проверенный production-паттерн оставляет MCP-сервер на loopback и публикует
+наружу только HTTPS-эндпоинт через Cloudflare Tunnel:
 
 ```text
-ChatGPT ↔ OpenAI Secure MCP Tunnel ↔ tunnel-client на этом хосте
-                                      ↔ 127.0.0.1:8765/mcp
+ChatGPT → https://your-domain.example.com/mcp?k=<секрет>
+        → Cloudflare WAF → Cloudflare Tunnel → 127.0.0.1:8765/mcp
 ```
 
-Конкретные команды и шаги настройки Secure MCP Tunnel зависят от текущего
-OpenAI workspace и актуальной документации OpenAI. Уточните их на момент
-подключения; этот репозиторий не выдумывает непроверенную OAuth/tunnel-команду.
+В этом варианте не используется «OpenAI Secure MCP Tunnel»: публичной
+self-serve документации OpenAI по настройке серверной стороны этого механизма
+сейчас нет. Пункт «Туннель» в интерфейсе ChatGPT — отдельный нативный механизм;
+ниже описан рабочий вариант с обычным публичным HTTPS-туннелем.
+
+#### ⚙️ systemd-сервис
+
+Запустите `letopis-mcp` как отдельный systemd unit под непривилегированным
+пользователем. Файл unit можно разместить, например, в
+`/etc/systemd/system/letopis-mcp.service`:
+
+```ini
+[Unit]
+Description=Letopis read-only MCP server
+After=network.target
+
+[Service]
+Type=simple
+User=<непривилегированный-пользователь>
+WorkingDirectory=<корень-репозитория-с-данными>
+EnvironmentFile=/etc/default/letopis-mcp
+ExecStart=<venv>/bin/letopis-mcp
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Файл `/etc/default/letopis-mcp` должен находиться вне git-репозитория и
+содержать как минимум конфигурацию SQLite и стабильный секрет курсоров:
+
+```sh
+LETOPIS_MCP_DB=<корень-репозитория-с-данными>/data/index.db
+LETOPIS_MCP_CURSOR_SECRET=<стабильный-секрет>
+```
+
+Замените плейсхолдеры на значения своей установки и закройте файл от лишних
+пользователей. После установки unit активируйте его так:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now letopis-mcp.service
+```
+
+Дополнительный `ReadWritePaths` не нужен: сервер сам открывает SQLite в режиме
+`mode=ro`, поэтому ему нужны только права чтения на индекс и необходимые
+SQLite sidecar-файлы.
+
+#### 🌐 Cloudflare Tunnel и HTTPS
+
+Настройте `cloudflared` на проксирование публичного имени к loopback-порту
+MCP-сервера. Существенная часть `config.yml` выглядит так:
+
+```yaml
+ingress:
+  - hostname: your-domain.example.com
+    service: http://127.0.0.1:8765
+    originRequest:
+      httpHostHeader: "127.0.0.1:8765"
+  - service: http_status:404
+```
+
+> **Важно про `Host` и DNS-rebinding-защиту.** MCP SDK по умолчанию включает
+> защиту от DNS rebinding, когда сервер привязан к loopback-адресу
+> (`127.0.0.1`/`localhost`): заголовок `Host` проверяется по списку
+> `127.0.0.1:*`, `localhost:*`, `[::1]:*`. Cloudflare Tunnel по умолчанию
+> передаёт на origin внешний `Host`, например
+> `your-domain.example.com`, поэтому без переписывания сервер отвечает
+> `421 Invalid Host header`. Эта проверка реализована в
+> `mcp/server/transport_security.py` MCP SDK.
+>
+> Параметр `originRequest.httpHostHeader` переписывает заголовок только при
+> передаче запроса к локальному origin и сохраняет защиту SDK включённой.
+> Порт после адреса обязателен: `"127.0.0.1"` без `:8765` не пройдёт проверку,
+> потому что шаблон `127.0.0.1:*` требует порт. Это правильное решение,
+> ослаблять DNS-rebinding-защиту в приложении не нужно.
+
+#### 🛡️ Авторизация на границе через Cloudflare WAF
+
+MCP v1 не реализует аутентификацию (см. раздел
+[«Безопасность deployment»](#безопасность-deployment)), поэтому публичный
+эндпоинт нужно защищать до того, как запрос попадёт в приложение. Cloudflare
+Access — один из вариантов, но включение Zero Trust-плана требует
+привязки карты даже на бесплатном тарифе. Проверенная бескарточная альтернатива
+— **WAF Custom Rule**, доступная на бесплатном плане (до пяти правил).
+
+В Cloudflare откройте **Security → Security rules → Custom rules** и создайте
+правило:
+
+- условие: `Hostname equals your-domain.example.com` **AND** `URI Query String does not contain "k=<секрет>"`;
+- действие: `Block`.
+
+В URL ChatGPT передайте тот же WAF-секрет query-параметром:
+
+```text
+https://your-domain.example.com/mcp?k=<секрет>
+```
+
+Секрет WAF — отдельное значение; не переиспользуйте для него
+`LETOPIS_MCP_CURSOR_SECRET`. При такой проверке запрос без `k` получает `403`
+ещё на границе Cloudflare, и MCP-сервер его не видит. Запрос с параметром
+доходит до сервера и обрабатывается нормально.
+
+Это грубее полноценной per-request-аутентификации: статичный секрет живёт в
+URL и может попасть в историю или логи. Но для сценария «URL случайно узнали
+или endpoint просканировали» такой edge-gate закрывает доступ без изменений в
+сервере и без дополнительных затрат. При утечке секрет следует заменить и
+обновить WAF-правило и URL коннектора.
+
+#### 🔌 Подключение в ChatGPT
+
+В ChatGPT создайте custom connector / плагин в режиме разработчика:
+
+1. Откройте **Developer mode → Settings → Plugins → `+`**.
+2. Для `Connection` выберите **«URL-адрес сервера»**, а не **«Туннель»**.
+3. Укажите URL `https://your-domain.example.com/mcp?k=<секрет>`.
+4. Для `Authentication` выберите **«Без авторизации»**. Это означает, что
+   MCP-протокол не использует OAuth: защита уже выполнена правилом Cloudflare
+   WAF. В форме также могут быть варианты OAuth и «Смешанные».
+5. Создайте подключение.
+
+В этой схеме ChatGPT успешно обнаруживает все пять retrieval-инструментов.
 
 ### Безопасность deployment
 
@@ -157,6 +280,10 @@ MCP-процессу нужны только `data/index.db` и необходи
 `.env`, `telegram.session*`, `archive/`, media или manifest. Запускайте сервер
 под отдельным Unix-пользователем с минимальными правами, а синхронизацию и
 индексацию выполняйте отдельным процессом с нужными правами записи.
+
+MCP v1 не реализует аутентификацию: endpoint сам не проверяет OAuth или другой
+identity пользователя. Поэтому при публичной публикации нужна внешняя защита
+на границе, например описанная выше WAF Custom Rule.
 
 ---
 
