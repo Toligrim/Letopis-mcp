@@ -13,11 +13,13 @@ import ipaddress
 import json
 import logging
 import os
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..config import load_config, project_root
+from ..db import connect_readonly, read_index_revision
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -42,6 +44,32 @@ _HANDLER_MARKER = "_letopis_mcp_json_handler"
 
 class SettingsError(ValueError):
     """Raised when an MCP runtime environment value is invalid."""
+
+
+class DiagnosticError(Exception):
+    """Raised when offline configuration or database validation fails."""
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticSummary:
+    db_path: Path
+    dev_mode: bool
+    cursor_secret_configured: bool
+    host: str
+    port: int
+
+    def format_human(self) -> str:
+        mode_str = "dev" if self.dev_mode else "production"
+        secret_str = (
+            "configured" if self.cursor_secret_configured else "not configured (allowed in dev mode)"
+        )
+        return (
+            "Letopis MCP configuration check: OK\n"
+            f"  Mode: {mode_str}\n"
+            f"  Database: {self.db_path}\n"
+            f"  Cursor secret: {secret_str}\n"
+            f"  Server endpoint: {self.host}:{self.port}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,3 +294,47 @@ def configure_logging(level: str) -> logging.Logger:
         handler.setFormatter(_JsonLogFormatter())
         logger.addHandler(handler)
     return logger
+
+
+def check_config(root: Path | None = None) -> DiagnosticSummary:
+    """Validate MCP settings, cursor-secret policy, and local SQLite read-only availability."""
+    try:
+        settings = load_settings(root)
+    except SettingsError as exc:
+        raise DiagnosticError(f"Invalid configuration: {exc}") from exc
+    except Exception as exc:
+        raise DiagnosticError(f"Configuration load failed: {exc}") from exc
+
+    cursor_secret_configured = bool(os.environ.get("LETOPIS_MCP_CURSOR_SECRET"))
+    if not settings.dev_mode and not cursor_secret_configured:
+        raise DiagnosticError(
+            "LETOPIS_MCP_CURSOR_SECRET is required in production mode "
+            "(set LETOPIS_MCP_DEV_MODE=true for dev mode)"
+        )
+
+    db_path = settings.db_path
+    if not db_path.exists():
+        raise DiagnosticError(f"Database path does not exist: {db_path}")
+    if not db_path.is_file():
+        raise DiagnosticError(f"Database path is not a file: {db_path}")
+
+    try:
+        conn = connect_readonly(db_path)
+    except Exception as exc:
+        raise DiagnosticError(f"Failed to open database read-only at {db_path}: {exc}") from exc
+
+    try:
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        read_index_revision(conn)
+    except sqlite3.Error as exc:
+        raise DiagnosticError(f"Database probe failed at {db_path}: {exc}") from exc
+    finally:
+        conn.close()
+
+    return DiagnosticSummary(
+        db_path=db_path,
+        dev_mode=settings.dev_mode,
+        cursor_secret_configured=cursor_secret_configured,
+        host=settings.host,
+        port=settings.port,
+    )
