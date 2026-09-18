@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import asdict
 import json
+import sys
 from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
@@ -68,7 +70,13 @@ from .models import (
     SEARCH_FILTER_ID_LIST_MAX,
     SEARCH_FILTER_SENDER_NAME_MAX_CHARS,
 )
-from .settings import MCPSettings, configure_logging, load_settings
+from .settings import (
+    DiagnosticError,
+    MCPSettings,
+    check_config,
+    configure_logging,
+    load_settings,
+)
 
 
 STREAMABLE_HTTP_PATH = "/mcp"
@@ -268,6 +276,8 @@ def _forbid_tool_extras(server: MCPServer, tool_name: str) -> None:
     argument_model.model_config = ConfigDict(**model_config)
     argument_model.model_rebuild(force=True)
     registered.parameters = argument_model.model_json_schema()
+    if registered.output_schema is not None and "type" not in registered.output_schema:
+        registered.output_schema["type"] = "object"
 
 
 def archive_overview(
@@ -423,8 +433,31 @@ def create_server(settings: MCPSettings | None = None) -> MCPServer:
     return server
 
 
-def main() -> None:
-    """Run the loopback-only Streamable HTTP endpoint."""
+def parse_args(args: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="letopis-mcp",
+        description="Letopis read-only Model Context Protocol (MCP) server.",
+    )
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Validate MCP runtime configuration and local SQLite database without starting the server.",
+    )
+    return parser.parse_args(args)
+
+
+def main(args: list[str] | None = None) -> None:
+    """Run the loopback-only Streamable HTTP endpoint or diagnostic check."""
+    parsed = parse_args(args)
+    if parsed.check_config:
+        try:
+            summary = check_config()
+            sys.stdout.write(summary.format_human() + "\n")
+            sys.exit(0)
+        except DiagnosticError as exc:
+            sys.stderr.write(f"Configuration check failed: {exc}\n")
+            sys.exit(1)
+
     settings = load_settings()
     create_server(settings).run(
         "streamable-http",
